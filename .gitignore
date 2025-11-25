@@ -37,10 +37,10 @@ ENV/
 .ipynb_checkpoints
 
 # Models (optional - uncomment if you don't want to track model files)
-# models/*.pkl
+models/*.pkl
 
 # Data files (optional - uncomment if you don't want to track data files)
-# data/*.csv
+data/*.csv
 
 # OS
 .DS_Store
