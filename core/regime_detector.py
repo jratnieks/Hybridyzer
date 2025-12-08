@@ -5,10 +5,21 @@ import numpy as np
 import pickle
 from pathlib import Path
 from typing import Literal, Optional
-import lightgbm as lgb
+
+# GPU support: Use cuML if available, fallback to CPU
+try:
+    import cudf
+    from cuml.ensemble import RandomForestClassifier as cuRFClassifier
+    GPU_AVAILABLE = True
+    print("[RegimeDetector] GPU acceleration available (cuML)")
+except ImportError:
+    GPU_AVAILABLE = False
+    cudf = None
+    cuRFClassifier = None
+    print("[RegimeDetector] cuML not available, will use CPU fallback if needed")
 
 
-RegimeType = Literal["trend_up", "trend_down", "chop", "high_vol", "low_vol"]
+RegimeType = Literal["trend_up", "trend_down", "chop"]
 
 
 def wilder_atr(df: pd.DataFrame, n: int) -> pd.Series:
@@ -25,43 +36,54 @@ def wilder_atr(df: pd.DataFrame, n: int) -> pd.Series:
 
 class RegimeDetector:
     """
-    ML-based regime detection using LightGBMClassifier.
+    GPU-accelerated regime detection using cuML RandomForestClassifier.
+    Falls back to CPU (pandas) if cuML is unavailable.
     """
 
-    def __init__(self, model_params: Optional[dict] = None):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = True):
         """
         Initialize regime detector.
         
         Args:
-            model_params: Optional LightGBM parameters
+            model_params: Optional cuML RandomForestClassifier parameters
+            use_gpu: Whether to use GPU acceleration (default: True, falls back to CPU if unavailable)
         """
         if model_params is None:
+            # cuML RandomForestClassifier parameters
             model_params = {
-                'objective': 'multiclass',
-                'num_class': 5,
-                'metric': 'multi_logloss',
-                'boosting_type': 'gbdt',
-                'num_leaves': 31,
-                'learning_rate': 0.05,
-                'feature_fraction': 0.9,
-                'bagging_fraction': 0.8,
-                'bagging_freq': 5,
-                'verbose': -1
+                'n_estimators': 100,
+                'max_depth': 16,
+                'n_bins': 128,
+                'split_criterion': 0,  # 0=GINI, 1=ENTROPY
+                'bootstrap': True,
+                'max_samples': 0.8,
+                'max_features': 0.9,
+                'n_streams': 4,
+                'random_state': 42
             }
         self.model_params = model_params
-        self.model: Optional[lgb.LGBMClassifier] = None
-        self.regime_classes = ["trend_up", "trend_down", "chop", "high_vol", "low_vol"]
+        self.use_gpu = use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None)
+        self.model: Optional[cuRFClassifier] = None
+        self.regime_classes = ["trend_up", "trend_down", "chop"]
         self.feature_names = []
+        
+        if self.use_gpu:
+            print("[RegimeDetector] GPU mode enabled (cuML RandomForestClassifier)")
+        else:
+            if use_gpu:
+                print("[RegimeDetector] GPU requested but cuML unavailable, will use CPU fallback")
+            else:
+                print("[RegimeDetector] CPU mode")
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
         """
-        Train the regime detection model.
+        Train the regime detection model on GPU using cuML.
         
         Args:
-            X: Feature dataframe
-            y: Regime labels (should be one of: trend_up, trend_down, chop, high_vol, low_vol)
+            X: Feature dataframe (pandas, will be converted to cuDF for GPU training)
+            y: Regime labels (should be one of: trend_up, trend_down, chop)
         """
-        # Clean features
+        # CPU: Clean features in pandas
         X_clean = X.copy()
         X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
         X_clean = X_clean.ffill().bfill().fillna(0)
@@ -87,26 +109,44 @@ class RegimeDetector:
         # Store feature names
         self.feature_names = X_clean.columns.tolist()
         
-        # Initialize and train model
-        self.model = lgb.LGBMClassifier(**self.model_params)
-        self.model.fit(X_clean, y_numeric)
-        
-        print(f"Regime detector trained on {len(X_clean)} samples with {len(self.feature_names)} features")
+        # GPU: Convert to cuDF for training
+        if self.use_gpu:
+            print(f"[RegimeDetector] Converting {len(X_clean)} samples to cuDF for GPU training...")
+            X_gpu = cudf.from_pandas(X_clean)
+            y_gpu = cudf.Series(y_numeric.values, dtype='int32')
+            
+            # Initialize and train model on GPU
+            self.model = cuRFClassifier(**self.model_params)
+            self.model.fit(X_gpu, y_gpu)
+            
+            print(f"[RegimeDetector] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
+        else:
+            # CPU fallback: Use scikit-learn RandomForestClassifier
+            from sklearn.ensemble import RandomForestClassifier
+            print("[RegimeDetector] Using CPU fallback (scikit-learn RandomForestClassifier)")
+            self.model = RandomForestClassifier(
+                n_estimators=self.model_params.get('n_estimators', 100),
+                max_depth=self.model_params.get('max_depth', 16),
+                random_state=42,
+                n_jobs=-1
+            )
+            self.model.fit(X_clean, y_numeric)
+            print(f"[RegimeDetector] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
         """
-        Predict regime for given features.
+        Predict regime for given features (GPU-accelerated if available).
         
         Args:
-            X: Feature dataframe
+            X: Feature dataframe (pandas, will be converted to cuDF for GPU prediction)
             
         Returns:
-            Series of regime labels
+            Series of regime labels (pandas)
         """
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
         
-        # Clean features
+        # CPU: Clean features in pandas
         X_clean = X.copy()
         X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
         X_clean = X_clean.ffill().bfill().fillna(0)
@@ -123,8 +163,15 @@ class RegimeDetector:
         # Align index
         X_clean = X_clean.reindex(X.index)
         
-        # Predict
-        predictions_numeric = self.model.predict(X_clean)
+        # GPU: Convert to cuDF and predict
+        if self.use_gpu:
+            X_gpu = cudf.from_pandas(X_clean)
+            predictions_numeric_gpu = self.model.predict(X_gpu)
+            # Convert back to pandas
+            predictions_numeric = predictions_numeric_gpu.to_pandas().values
+        else:
+            # CPU: Predict directly
+            predictions_numeric = self.model.predict(X_clean)
         
         # Convert back to regime labels
         label_map = {idx: regime for idx, regime in enumerate(self.regime_classes)}
@@ -139,18 +186,18 @@ class RegimeDetector:
 
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         """
-        Predict regime probabilities.
+        Predict regime probabilities (GPU-accelerated if available).
         
         Args:
-            X: Feature dataframe
+            X: Feature dataframe (pandas, will be converted to cuDF for GPU prediction)
             
         Returns:
-            DataFrame with probabilities for each regime
+            DataFrame with probabilities for each regime (pandas)
         """
         if self.model is None:
             raise ValueError("Model not trained. Call fit() first.")
         
-        # Clean features
+        # CPU: Clean features in pandas
         X_clean = X.copy()
         X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
         X_clean = X_clean.ffill().bfill().fillna(0)
@@ -166,8 +213,15 @@ class RegimeDetector:
         # Align index
         X_clean = X_clean.reindex(X.index)
         
-        # Predict probabilities
-        proba = self.model.predict_proba(X_clean)
+        # GPU: Convert to cuDF and predict probabilities
+        if self.use_gpu:
+            X_gpu = cudf.from_pandas(X_clean)
+            proba_gpu = self.model.predict_proba(X_gpu)
+            # Convert back to pandas
+            proba = proba_gpu.to_pandas().values
+        else:
+            # CPU: Predict probabilities directly
+            proba = self.model.predict_proba(X_clean)
         
         # Create dataframe with regime labels as columns
         proba_df = pd.DataFrame(
@@ -192,11 +246,13 @@ class RegimeDetector:
         path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save model and metadata
+        # Note: cuML models are pickle-able and will work on GPU when loaded if cuML is available
         model_data = {
             'model': self.model,
             'model_params': self.model_params,
             'regime_classes': self.regime_classes,
-            'feature_names': self.feature_names
+            'feature_names': self.feature_names,
+            'use_gpu': self.use_gpu  # Store GPU mode preference
         }
         
         with open(path, 'wb') as f:
@@ -223,5 +279,13 @@ class RegimeDetector:
         self.model_params = model_data.get('model_params', {})
         self.regime_classes = model_data.get('regime_classes', self.regime_classes)
         self.feature_names = model_data.get('feature_names', [])
+        # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
+        saved_use_gpu = model_data.get('use_gpu', False)
+        if saved_use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None):
+            self.use_gpu = True
+            print(f"[RegimeDetector] Model loaded (was trained on GPU, will use GPU for inference)")
+        else:
+            self.use_gpu = False
+            print(f"[RegimeDetector] Model loaded (CPU mode)")
         
         print(f"Regime detector loaded from {path}")

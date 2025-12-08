@@ -222,17 +222,80 @@ class BTCDataLoader:
         return True
 
 
-def load_btc_csv(csv_path: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+def load_btc_csv(path: str = 'data/btc_1m.csv') -> pd.DataFrame:
     """
-    Convenience function to load BTC CSV data.
+    Load BTC CSV data with UTC datetime index.
     
     Args:
-        csv_path: Path to CSV file
-        start_date: Optional start date filter (YYYY-MM-DD)
-        end_date: Optional end date filter (YYYY-MM-DD)
+        path: Path to CSV file (default: 'data/btc_1m.csv')
         
     Returns:
-        Clean OHLCV DataFrame with datetime index
+        Clean OHLCV DataFrame with UTC datetime index, sorted by time.
+        Columns: open, high, low, close, volume (all as float)
     """
-    loader = BTCDataLoader()
-    return loader.load_data(csv_path=csv_path, start_date=start_date, end_date=end_date)
+    # Read CSV with optimized parameters for large files
+    # Use float32 to reduce memory, low_memory=False for better performance on large files
+    df = pd.read_csv(
+        path,
+        dtype={'open': np.float32, 'high': np.float32, 'low': np.float32, 
+               'close': np.float32, 'volume': np.float32},
+        low_memory=False
+    )
+    
+    # Standardize column names (case-insensitive mapping)
+    col_mapping = {
+        'time': 'timestamp', 'Time': 'timestamp', 'TIME': 'timestamp',
+        'date': 'timestamp', 'Date': 'timestamp', 'DATE': 'timestamp',
+        'datetime': 'timestamp', 'DateTime': 'timestamp', 'DATETIME': 'timestamp',
+        'Open': 'open', 'OPEN': 'open',
+        'High': 'high', 'HIGH': 'high',
+        'Low': 'low', 'LOW': 'low',
+        'Close': 'close', 'CLOSE': 'close',
+        'Volume': 'volume', 'VOLUME': 'volume', 'vol': 'volume', 'VOL': 'volume'
+    }
+    
+    # Rename columns (only if they exist)
+    rename_dict = {old: new for old, new in col_mapping.items() if old in df.columns}
+    df = df.rename(columns=rename_dict)
+    
+    # Check for required OHLCV columns
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns: {missing_cols}. "
+            f"Found columns: {df.columns.tolist()}"
+        )
+    
+    # Parse timestamp as UTC datetime
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
+        df = df.set_index('timestamp')
+    else:
+        # Try to parse index as UTC datetime
+        df.index = pd.to_datetime(df.index, utc=True, errors='coerce')
+    
+    # Remove rows with invalid timestamps
+    df = df[df.index.notna()]
+    
+    if df.empty:
+        raise ValueError("No valid timestamps found in CSV")
+    
+    # Ensure columns as float32 (already converted if dtype dict worked, but ensure consistency)
+    for col in required_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').astype(np.float32)
+    
+    # Remove rows with NaN in OHLCV
+    df = df.dropna(subset=required_cols)
+    
+    if df.empty:
+        raise ValueError("No valid OHLCV data after cleaning")
+    
+    # Sort by index
+    df = df.sort_index()
+    
+    # Select only OHLCV columns (in correct order)
+    df = df[required_cols]
+    
+    return df
