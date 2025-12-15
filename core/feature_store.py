@@ -23,6 +23,7 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 from typing import List
+from pathlib import Path
 import time
 from modules.base import SignalModule, ContextModule
 from modules.superma import SuperMA4hr
@@ -1629,6 +1630,47 @@ class FeatureStore:
                     cleaned[col] = pd.to_numeric(cleaned[col], errors='coerce')
                 except (ValueError, TypeError):
                     pass
-        
+
         return cleaned
+
+    def build_and_cache(
+        self,
+        df: pd.DataFrame,
+        signal_modules: List[SignalModule],
+        context_modules: List[ContextModule],
+        cache_path: "Path",
+        force_recompute: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Build features once, persist to Parquet, and return the cached frame.
+
+        This prevents repeated computation across walk-forward windows, which is
+        the dominant runtime cost in the training pipeline.
+        """
+        cache_path = Path(cache_path)
+        if cache_path.exists() and not force_recompute:
+            return self.load_cached(cache_path)
+
+        features = self.build_features(df, signal_modules, context_modules)
+        features = self.clean_features(features)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        features.to_parquet(cache_path)
+        return features
+
+    def load_cached(self, cache_path: "Path") -> pd.DataFrame:
+        """Load cached features and restore internal metadata."""
+        cache_path = Path(cache_path)
+        if not cache_path.exists():
+            raise FileNotFoundError(f"Cached features not found at {cache_path}")
+
+        features = pd.read_parquet(cache_path)
+        self.feature_columns = features.columns.tolist()
+        self.features = features
+        return features
+
+    def slice(self, features: pd.DataFrame, start_ts, end_ts) -> pd.DataFrame:
+        """
+        Return a time-sliced view of cached features without recomputation.
+        """
+        return features[(features.index >= start_ts) & (features.index < end_ts)]
 

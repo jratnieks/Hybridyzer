@@ -170,7 +170,7 @@ def train_one_window(
     df_train: pd.DataFrame,
     signal_modules: List,
     context_modules: List,
-    feature_store: FeatureStore,
+    feats_train: pd.DataFrame,
     horizon_bars: int = 48,
     label_threshold: float = 0.0005
 ) -> Tuple[RegimeDetector, SignalBlender, Dict]:
@@ -181,19 +181,18 @@ def train_one_window(
         df_train: Training data window
         signal_modules: List of signal modules
         context_modules: List of context modules
-        feature_store: FeatureStore instance
         horizon_bars: Forward horizon in bars for direction labels
         label_threshold: Threshold for direction labels
         
     Returns:
         Tuple of (regime_detector, signal_blender, training_stats)
     """
-    # Build features
-    feats = feature_store.build_features(df_train, signal_modules, context_modules)
-    feats = feature_store.clean_features(feats)
-    
+    # Enforce index integrity between raw data and cached features to avoid
+    # silent misalignment after cleaning/warmups.
+    assert feats_train.index.equals(df_train.index), "Feature/price index mismatch in training window"
+
     # Generate labels
-    regime_y = rule_based_regime(feats, df_train)
+    regime_y = rule_based_regime(feats_train, df_train)
     # Use new direction labels
     df_labeled = make_direction_labels(
         df_train,
@@ -201,15 +200,15 @@ def train_one_window(
         label_threshold=label_threshold,
         debug=False  # Suppress debug output in walk-forward windows
     )
-    blend_y = df_labeled['blend_label'].reindex(feats.index).fillna(0).astype(int)
+    blend_y = df_labeled['blend_label'].reindex(feats_train.index).fillna(0).astype(int)
     
     # Remove invalid rows
     valid_mask = ~(regime_y.isna() | blend_y.isna())
     valid_mask = valid_mask & (regime_y.isin(['trend_up', 'trend_down', 'chop']))
     
-    X_regime = feats[valid_mask]
+    X_regime = feats_train[valid_mask]
     regime_y = regime_y[valid_mask]
-    X_blend_base = feats[valid_mask]
+    X_blend_base = feats_train[valid_mask]
     blend_y = blend_y[valid_mask]
     
     # Compute module signals for blender
@@ -239,7 +238,7 @@ def train_one_window(
         'train_samples': len(X_regime),
         'regime_dist': regime_y.value_counts().to_dict(),
         'blend_dist': blend_y.value_counts().to_dict(),
-        'feature_count': len(feats.columns)
+        'feature_count': len(feats_train.columns)
     }
     
     return reg, blender, stats
@@ -251,7 +250,7 @@ def validate_one_window(
     blender_model: SignalBlender,
     signal_modules: List,
     context_modules: List,
-    feature_store: FeatureStore,
+    feats_val: pd.DataFrame,
     horizon_bars: int = 48,
     label_threshold: float = 0.0005
 ) -> Dict:
@@ -264,34 +263,33 @@ def validate_one_window(
         blender_model: Trained signal blender
         signal_modules: List of signal modules
         context_modules: List of context modules
-        feature_store: FeatureStore instance
         horizon_bars: Forward horizon in bars for direction labels
         label_threshold: Threshold for direction labels
         
     Returns:
         Dictionary with validation metrics
     """
-    # Build features
-    feats = feature_store.build_features(df_val, signal_modules, context_modules)
-    feats = feature_store.clean_features(feats)
-    
+    # Enforce index integrity between raw data and cached features to avoid
+    # silent misalignment after cleaning/warmups.
+    assert feats_val.index.equals(df_val.index), "Feature/price index mismatch in validation window"
+
     # Generate true labels (use new direction labels for consistency)
-    regime_y_true = rule_based_regime(feats, df_val)
+    regime_y_true = rule_based_regime(feats_val, df_val)
     df_labeled = make_direction_labels(
         df_val,
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
         debug=False  # Suppress debug output in walk-forward windows
     )
-    blend_y_true = df_labeled['blend_label'].reindex(feats.index).fillna(0).astype(int)
+    blend_y_true = df_labeled['blend_label'].reindex(feats_val.index).fillna(0).astype(int)
     
     # Remove invalid rows
     valid_mask = ~(regime_y_true.isna() | blend_y_true.isna())
     valid_mask = valid_mask & (regime_y_true.isin(['trend_up', 'trend_down', 'chop']))
     
-    X_regime = feats[valid_mask]
+    X_regime = feats_val[valid_mask]
     regime_y_true = regime_y_true[valid_mask]
-    X_blend_base = feats[valid_mask]
+    X_blend_base = feats_val[valid_mask]
     blend_y_true = blend_y_true[valid_mask]
     
     # Predict regime
@@ -347,11 +345,113 @@ def validate_one_window(
     return metrics
 
 
+def build_features_once(
+    df: pd.DataFrame,
+    signal_modules: List,
+    context_modules: List,
+    cache_path: Path,
+    force_recompute: bool = False,
+    use_gpu: bool = False,
+) -> Tuple[FeatureStore, pd.DataFrame]:
+    """
+    Compute all features exactly once, cache to Parquet, and reuse for slicing.
+
+    This centralizes the expensive feature computation step and ensures the
+    walk-forward loop only slices cached features instead of rebuilding per
+    window.
+    """
+    feature_store = FeatureStore(use_gpu=use_gpu)
+    cached_features = feature_store.build_and_cache(
+        df,
+        signal_modules,
+        context_modules,
+        cache_path,
+        force_recompute=force_recompute,
+    )
+    return feature_store, cached_features
+
+
+def slice_window(
+    df: pd.DataFrame,
+    features: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Slice cached features and raw data for a time window, enforcing alignment.
+
+    Labels always derive from the raw df slice; models see the cached features
+    on the exact same index. Any divergence is a correctness bug and must fail
+    fast.
+    """
+    feats_window = features[(features.index >= start_ts) & (features.index < end_ts)]
+    df_window = df.loc[feats_window.index]
+
+    if not feats_window.index.equals(df_window.index):
+        raise ValueError("Cached feature index diverged from raw data during slicing")
+
+    return df_window, feats_window
+
+
+def prepare_windows(
+    df: pd.DataFrame,
+    train_months: int,
+    val_months: int,
+    slide_months: int,
+) -> List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
+    """Lightweight wrapper to document walk-forward split generation."""
+    return generate_splits(df, train_months, val_months, slide_months)
+
+
+def train_models_for_window(
+    df_window: pd.DataFrame,
+    feats_window: pd.DataFrame,
+    signal_modules: List,
+    context_modules: List,
+    horizon_bars: int,
+    label_threshold: float,
+) -> Tuple[RegimeDetector, SignalBlender, Dict]:
+    """Thin wrapper to make the training stage signature explicit."""
+    return train_one_window(
+        df_window,
+        signal_modules,
+        context_modules,
+        feats_window,
+        horizon_bars=horizon_bars,
+        label_threshold=label_threshold,
+    )
+
+
+def validate_models_for_window(
+    df_window: pd.DataFrame,
+    feats_window: pd.DataFrame,
+    reg_model: RegimeDetector,
+    blender_model: SignalBlender,
+    signal_modules: List,
+    context_modules: List,
+    horizon_bars: int,
+    label_threshold: float,
+) -> Dict:
+    """Thin wrapper to make the validation stage signature explicit."""
+    return validate_one_window(
+        df_window,
+        reg_model,
+        blender_model,
+        signal_modules,
+        context_modules,
+        feats_window,
+        horizon_bars=horizon_bars,
+        label_threshold=label_threshold,
+    )
+
+
 def combined_training(
     df: pd.DataFrame,
     signal_modules: List,
     context_modules: List,
     models_dir: Path,
+    feature_cache_path: Optional[Path] = None,
+    force_recompute_cache: bool = False,
     train_months: int = 6,
     val_months: int = 1,
     slide_months: int = 1,
@@ -375,10 +475,19 @@ def combined_training(
     Returns:
         Tuple of (final_regime_detector, final_signal_blender)
     """
-    feature_store = FeatureStore()
-    
+    # Force a single feature build to avoid O(N x windows) recomputation costs.
+    cache_path = feature_cache_path or (models_dir / "cached_features.parquet")
+    feature_store, cached_features = build_features_once(
+        df,
+        signal_modules,
+        context_modules,
+        cache_path,
+        force_recompute=force_recompute_cache,
+        use_gpu=False,
+    )
+
     # Generate splits
-    splits = generate_splits(df, train_months, val_months, slide_months)
+    splits = prepare_windows(df, train_months, val_months, slide_months)
     
     if len(splits) == 0:
         raise ValueError("No valid splits generated. Check data range and window sizes.")
@@ -400,39 +509,53 @@ def combined_training(
         print(f"Val:   {val_start.date()} to {val_end.date()}")
         print(f"{'='*60}")
         
-        # Extract windows
-        df_train = df[(df.index >= train_start) & (df.index < train_end)]
-        df_val = df[(df.index >= val_start) & (df.index < val_end)]
-        
+        # Extract windows using cached feature index to prevent any recomputation
+        try:
+            df_train, feats_train = slice_window(df, cached_features, train_start, train_end)
+            df_val, feats_val = slice_window(df, cached_features, val_start, val_end)
+        except ValueError as e:
+            print(f"Warning: Skipping window {i} due to alignment error: {e}")
+            continue
+
         if len(df_train) == 0 or len(df_val) == 0:
             print(f"Warning: Skipping window {i} - insufficient data")
             continue
-        
-        # Train on window
+
+        # Train on window using cached features to prevent repeated computation
         print("Training models...")
         try:
-            reg, blender, train_stats = train_one_window(
-                df_train, signal_modules, context_modules, feature_store, 
-                horizon_bars=horizon_bars, label_threshold=label_threshold
+            reg, blender, train_stats = train_models_for_window(
+                df_train,
+                feats_train,
+                signal_modules,
+                context_modules,
+                horizon_bars,
+                label_threshold,
             )
             print(f"  Training samples: {train_stats['train_samples']}")
             print(f"  Features: {train_stats['feature_count']}")
         except Exception as e:
             print(f"  Error during training: {e}")
             continue
-        
+
         # Validate on window
         print("Validating models...")
         try:
-            val_metrics = validate_one_window(
-                df_val, reg, blender, signal_modules, context_modules, feature_store,
-                horizon_bars=horizon_bars, label_threshold=label_threshold
+            val_metrics = validate_models_for_window(
+                df_val,
+                feats_val,
+                reg,
+                blender,
+                signal_modules,
+                context_modules,
+                horizon_bars,
+                label_threshold,
             )
             print(f"  Validation samples: {val_metrics['val_samples']}")
             print(f"  Regime accuracy: {val_metrics['regime_accuracy']:.4f}")
             print(f"  Blend accuracy: {val_metrics['blend_accuracy']:.4f}")
             print(f"  Cumulative return: {val_metrics['cumulative_return']:.4f}")
-            
+
             # Track best model
             if val_metrics['cumulative_return'] > best_val_return:
                 best_val_return = val_metrics['cumulative_return']
@@ -486,10 +609,14 @@ def combined_training(
         if len(all_results) > 0:
             # Retrain on last window
             last_split = splits[-1]
-            df_train = df[(df.index >= last_split[0]) & (df.index < last_split[1])]
-            best_reg, best_blender, _ = train_one_window(
-                df_train, signal_modules, context_modules, feature_store,
-                horizon_bars=horizon_bars, label_threshold=label_threshold
+            df_train, feats_last = slice_window(df, cached_features, last_split[0], last_split[1])
+            best_reg, best_blender, _ = train_models_for_window(
+                df_train,
+                feats_last,
+                signal_modules,
+                context_modules,
+                horizon_bars,
+                label_threshold,
             )
         else:
             raise ValueError("Cannot create final models - no successful training")
@@ -844,11 +971,17 @@ def main():
     
     print(f"Loaded {len(df)} bars from {df.index[0]} to {df.index[-1]}")
     
-    # 2. Build the feature store with FeatureStore().build(df)
-    print("\nBuilding feature store...")
+    # 2. Build or load cached features once to avoid recomputation across runs
+    cache_path = models_dir / "cached_features.parquet"
     feature_store = FeatureStore()
-    feats = feature_store.build(df)
-    print(f"Built {len(feats.columns)} features")
+    feature_store, feats = build_features_once(
+        df,
+        signal_modules=feature_store.signal_modules,
+        context_modules=feature_store.context_modules,
+        cache_path=cache_path,
+        use_gpu=False,
+    )
+    print(f"[Features] Loaded cached features: {feats.shape}")
     
     # Print final feature columns for verification
     print("\nFINAL FEATURE COLUMNS:", feats.columns.tolist())
