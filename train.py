@@ -778,11 +778,17 @@ def main():
                         help='Forward horizon in bars for label generation (default: 48 = 4 hours for 5-min data)')
     parser.add_argument('--label-threshold', type=float, default=0.0005,
                         help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
+    parser.add_argument('--runpod', action='store_true',
+                        help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     args = parser.parse_args()
-    
+
     # Configuration
-    models_dir = Path("models")
-    models_dir.mkdir(exist_ok=True)
+    base_dir = Path("/workspace/Hybridyzer") if args.runpod else Path.cwd()
+    data_dir = base_dir / "data"
+    models_dir = base_dir / "models"
+    results_dir = base_dir / "results"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     
     # Calibration settings - defaults to always calibrate
     if args.disable_calibration:
@@ -806,16 +812,16 @@ def main():
     print("Loading BTC CSV data...")
     # Prefer 4H data for faster experimentation, then fall back to 1m
     csv_paths = [
-        'data/btcusd_4H.csv',           # 4-hour data (small, fast)
-        'data/btcusd_1min.csv',         # 1-minute data (large)
-        'data/btc_1m.csv',
-        'data/btcusd_1min_volspikes.csv',
-        'data/btc_data.csv',
+        data_dir / 'btcusd_4H.csv',           # 4-hour data (small, fast)
+        data_dir / 'btcusd_1min.csv',         # 1-minute data (large)
+        data_dir / 'btc_1m.csv',
+        data_dir / 'btcusd_1min_volspikes.csv',
+        data_dir / 'btc_data.csv',
     ]
     df = None
     for path in csv_paths:
         try:
-            df = load_btc_csv(path)
+            df = load_btc_csv(str(path))
             print(f"Loaded from: {path}")
             break
         except FileNotFoundError:
@@ -823,7 +829,6 @@ def main():
     
     if df is None:
         # Try to find any CSV in data directory
-        data_dir = Path("data")
         csv_files = list(data_dir.glob("*.csv"))
         if csv_files:
             df = load_btc_csv(str(csv_files[0]))
@@ -1068,18 +1073,18 @@ def main():
     
     if args.use_full_pipeline:
         # Use full pipeline with pruning and diagnostics
-        signal_blender, signal_diagnostics = train_full_pipeline(
-            X_train=X_blend_train_scaled,
-            y_train=y_blend_train,
-            X_val=X_blend_val_scaled,
-            y_val=y_blend_val,
-            model_class=SignalBlender,
-            model_name="SignalBlender",
-            calibration_method=calibration_method,
-            sharpening_alpha=sharpening_alpha,
-            models_dir=models_dir,
-            results_dir=Path("results")
-        )
+            signal_blender, signal_diagnostics = train_full_pipeline(
+                X_train=X_blend_train_scaled,
+                y_train=y_blend_train,
+                X_val=X_blend_val_scaled,
+                y_val=y_blend_val,
+                model_class=SignalBlender,
+                model_name="SignalBlender",
+                calibration_method=calibration_method,
+                sharpening_alpha=sharpening_alpha,
+                models_dir=models_dir,
+                results_dir=results_dir
+            )
     else:
         # Legacy training path
         print(f"Training on {len(X_blend_train)} samples...")
@@ -1210,7 +1215,7 @@ def main():
             calibration_method=calibration_method,
             sharpening_alpha=sharpening_alpha,
             models_dir=models_dir,
-            results_dir=Path("results")
+            results_dir=results_dir
         )
     else:
         # Legacy training path
