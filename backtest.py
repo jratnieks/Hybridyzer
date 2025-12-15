@@ -385,9 +385,11 @@ def main():
     print("="*60 + "\n")
     
     base_dir = Path("/workspace/Hybridyzer") if args.runpod else Path.cwd()
+    base_dir.mkdir(parents=True, exist_ok=True)
     data_dir = base_dir / "data"
     models_dir = base_dir / "models"
     results_dir = base_dir / "results"
+    data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
