@@ -312,11 +312,11 @@ def main():
     parser.add_argument('--horizon-bars', type=int, default=48,
                         help='Forward horizon in bars for label generation (default: 48 = 4 hours for 5-min data)')
     parser.add_argument('--label-threshold', type=float, default=0.0005,
-                        help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
+                        help='Threshold for direction labels (default: 0.0005 = 0.05%)')
     parser.add_argument('--dump-ev-analysis', action='store_true',
                         help='Dump EV diagnostics, plots, and tables to results/')
-    parser.add_argument('--no-gpu', action='store_true',
-                        help='Disable GPU acceleration for feature generation (use CPU only)')
+    parser.add_argument('--use-cuml', action='store_true',
+                        help='Enable cuML/cuDF GPU models (requires RAPIDS; fails if unavailable)')
     parser.add_argument('--chunk-size', type=int, default=100000,
                         help='Chunk size for GPU processing (default: 100000, reduce to 50000 if OOM)')
     parser.add_argument('--runpod', action='store_true',
@@ -413,11 +413,17 @@ def main():
             raise FileNotFoundError("No BTC CSV file found in data/ directory")
     
     # 2. Build features with FeatureStore (same settings as train.py)
-    use_gpu = not args.no_gpu
-    print(f"\nBuilding feature store... (GPU: {use_gpu}, chunk_size: {args.chunk_size})")
+    use_cuml = args.use_cuml
+    if use_cuml:
+        print("[GPU] cuML requested via --use-cuml")
+    else:
+        print("[CPU] sklearn backend active (no --use-cuml)")
+
+    feature_store_use_gpu = False
+    print(f"\nBuilding feature store... (GPU: {feature_store_use_gpu}, chunk_size: {args.chunk_size})")
     feature_store = FeatureStore(
         safe_mode=True,
-        use_gpu=use_gpu,
+        use_gpu=feature_store_use_gpu,
         chunk_size=args.chunk_size
     )
     
@@ -443,30 +449,30 @@ def main():
         raise FileNotFoundError(f"Direction model not found: {direction_model_path}")
     
     print("\nLoading models...")
-    regime_detector = RegimeDetector(use_gpu=True)
+    regime_detector = RegimeDetector(use_gpu=use_cuml)
     regime_detector.load(str(regime_model_path))
-    print("Loaded RegimeDetector (GPU: True)")
+    print(f"Loaded RegimeDetector (GPU: {use_cuml})")
     
     # Try to load calibrated models first, fall back to regular models
     blender_calibrated_path = models_dir / "blender_calibrated.pkl"
     if blender_calibrated_path.exists():
-        signal_blender = SignalBlender(use_gpu=True)
+        signal_blender = SignalBlender(use_gpu=use_cuml)
         signal_blender.load(str(blender_calibrated_path))
-        print("Loaded SignalBlender (calibrated) (GPU: True)")
+        print(f"Loaded SignalBlender (calibrated) (GPU: {use_cuml})")
     else:
-        signal_blender = SignalBlender(use_gpu=True)
+        signal_blender = SignalBlender(use_gpu=use_cuml)
         signal_blender.load(str(blender_model_path))
-        print("Loaded SignalBlender (GPU: True)")
+        print(f"Loaded SignalBlender (GPU: {use_cuml})")
     
     direction_calibrated_path = models_dir / "blender_direction_calibrated.pkl"
     if direction_calibrated_path.exists():
-        direction_blender = DirectionBlender(use_gpu=True)
+        direction_blender = DirectionBlender(use_gpu=use_cuml)
         direction_blender.load(str(direction_calibrated_path))
-        print("Loaded DirectionBlender (calibrated) (GPU: True)")
+        print(f"Loaded DirectionBlender (calibrated) (GPU: {use_cuml})")
     else:
-        direction_blender = DirectionBlender(use_gpu=True)
+        direction_blender = DirectionBlender(use_gpu=use_cuml)
         direction_blender.load(str(direction_model_path))
-        print("Loaded DirectionBlender (GPU: True)")
+        print(f"Loaded DirectionBlender (GPU: {use_cuml})")
     
     # Instantiate FinalSignalGenerator with profile settings
     # MERGE ORDER: defaults → CLI → profile (profile HARD overrides)
@@ -476,7 +482,7 @@ def main():
         'regime_detector': regime_detector,
         'signal_blender': signal_blender,
         'direction_blender': direction_blender,
-        'use_gpu': True,
+        'use_gpu': use_cuml,
         'require_blender_agreement': True,
         'probability_threshold': prob_threshold,
         'p_long': p_long,

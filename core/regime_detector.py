@@ -4,19 +4,7 @@ import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
-from typing import Literal, Optional
-
-# GPU support: Use cuML if available, fallback to CPU
-try:
-    import cudf
-    from cuml.ensemble import RandomForestClassifier as cuRFClassifier
-    GPU_AVAILABLE = True
-    print("[RegimeDetector] GPU acceleration available (cuML)")
-except ImportError:
-    GPU_AVAILABLE = False
-    cudf = None
-    cuRFClassifier = None
-    print("[RegimeDetector] cuML not available, will use CPU fallback if needed")
+from typing import Literal, Optional, Tuple
 
 
 RegimeType = Literal["trend_up", "trend_down", "chop"]
@@ -40,13 +28,13 @@ class RegimeDetector:
     Falls back to CPU (pandas) if cuML is unavailable.
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = True):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
         """
         Initialize regime detector.
-        
+
         Args:
-            model_params: Optional cuML RandomForestClassifier parameters
-            use_gpu: Whether to use GPU acceleration (default: True, falls back to CPU if unavailable)
+            model_params: Optional cuML/CPU RandomForestClassifier parameters
+            use_gpu: Whether to use GPU acceleration (default: False; requires explicit flag)
         """
         if model_params is None:
             # cuML RandomForestClassifier parameters
@@ -62,18 +50,27 @@ class RegimeDetector:
                 'random_state': 42
             }
         self.model_params = model_params
-        self.use_gpu = use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None)
-        self.model: Optional[cuRFClassifier] = None
+        self.use_gpu = use_gpu
+        self.model = None
         self.regime_classes = ["trend_up", "trend_down", "chop"]
         self.feature_names = []
-        
+        self._cudf = None
+        self._cuRFClassifier = None
+
         if self.use_gpu:
-            print("[RegimeDetector] GPU mode enabled (cuML RandomForestClassifier)")
+            self._cudf, self._cuRFClassifier = self._require_cuml()
+            print("[GPU] cuML enabled for RegimeDetector")
         else:
-            if use_gpu:
-                print("[RegimeDetector] GPU requested but cuML unavailable, will use CPU fallback")
-            else:
-                print("[RegimeDetector] CPU mode")
+            print("[CPU] sklearn backend active for RegimeDetector")
+
+    @staticmethod
+    def _require_cuml() -> Tuple[object, object]:
+        try:
+            import cudf  # type: ignore
+            from cuml.ensemble import RandomForestClassifier as cuRFClassifier  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("cuML/cuDF are required when use_gpu=True") from exc
+        return cudf, cuRFClassifier
 
     def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
         """
@@ -111,19 +108,20 @@ class RegimeDetector:
         
         # GPU: Convert to cuDF for training
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
+            cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
             print(f"[RegimeDetector] Converting {len(X_clean)} samples to cuDF for GPU training...")
             X_gpu = cudf.from_pandas(X_clean)
             y_gpu = cudf.Series(y_numeric.values, dtype='int32')
-            
+
             # Initialize and train model on GPU
             self.model = cuRFClassifier(**self.model_params)
             self.model.fit(X_gpu, y_gpu)
-            
+
             print(f"[RegimeDetector] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
-            # CPU fallback: Use scikit-learn RandomForestClassifier
             from sklearn.ensemble import RandomForestClassifier
-            print("[RegimeDetector] Using CPU fallback (scikit-learn RandomForestClassifier)")
+            print("[CPU] sklearn backend active")
             self.model = RandomForestClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -165,6 +163,7 @@ class RegimeDetector:
         
         # GPU: Convert to cuDF and predict
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             predictions_numeric_gpu = self.model.predict(X_gpu)
             # Convert back to pandas
@@ -215,6 +214,7 @@ class RegimeDetector:
         
         # GPU: Convert to cuDF and predict probabilities
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             proba_gpu = self.model.predict_proba(X_gpu)
             # Convert back to pandas
@@ -281,11 +281,13 @@ class RegimeDetector:
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
-        if saved_use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None):
-            self.use_gpu = True
-            print(f"[RegimeDetector] Model loaded (was trained on GPU, will use GPU for inference)")
+        if saved_use_gpu and self.use_gpu:
+            self._cudf, self._cuRFClassifier = self._require_cuml()
+            print(f"[GPU] cuML enabled for RegimeDetector (loaded)")
         else:
+            if saved_use_gpu and not self.use_gpu:
+                print("[CPU] RegimeDetector trained on GPU, running with CPU backend per configuration")
             self.use_gpu = False
-            print(f"[RegimeDetector] Model loaded (CPU mode)")
+            print(f"[CPU] sklearn backend active for RegimeDetector (loaded)")
         
         print(f"Regime detector loaded from {path}")

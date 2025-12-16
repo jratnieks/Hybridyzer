@@ -4,19 +4,7 @@ import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
-from typing import Optional
-
-# GPU support: Use cuML if available, fallback to CPU
-try:
-    import cudf
-    from cuml.ensemble import RandomForestClassifier as cuRFClassifier
-    GPU_AVAILABLE = True
-    print("[SignalBlender] GPU acceleration available (cuML)")
-except ImportError:
-    GPU_AVAILABLE = False
-    cudf = None
-    cuRFClassifier = None
-    print("[SignalBlender] cuML not available, will use CPU fallback if needed")
+from typing import Optional, Tuple
 
 # Calibration support
 try:
@@ -37,7 +25,7 @@ class BlenderBase:
     """
     
     def _fit_calibration(
-        self, 
+        self,
         X_train: pd.DataFrame, 
         y_train: pd.Series,
         X_val: Optional[pd.DataFrame] = None,
@@ -68,6 +56,7 @@ class BlenderBase:
         
         # Get raw probabilities from base model
         if self.use_gpu:
+            cudf = self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_cal)
             proba_raw = self.model.predict_proba(X_gpu).to_pandas().values
         else:
@@ -185,8 +174,17 @@ class BlenderBase:
         
         # Clip probabilities
         proba = self._clip_probabilities(proba)
-        
+
         return proba
+
+    @staticmethod
+    def _require_cuml() -> Tuple[object, object]:
+        try:
+            import cudf  # type: ignore
+            from cuml.ensemble import RandomForestClassifier as cuRFClassifier  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("cuML/cuDF are required when use_gpu=True") from exc
+        return cudf, cuRFClassifier
 
 
 class SignalBlender(BlenderBase):
@@ -196,7 +194,7 @@ class SignalBlender(BlenderBase):
     Outputs final long/short/flat labels from features.
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = True):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
         """
         Initialize signal blender.
         
@@ -218,12 +216,14 @@ class SignalBlender(BlenderBase):
                 'random_state': 42
             }
         self.model_params = model_params
-        self.use_gpu = use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None)
-        self.model: Optional[cuRFClassifier] = None
+        self.use_gpu = use_gpu
+        self.model = None
         self.signal_classes = [-1, 0, 1]  # short, flat, long
         self.feature_names = []
         self.feature_importances_ = None  # Will be populated after training
         self.name = "SignalBlender"  # For saving feature importances
+        self._cudf = None
+        self._cuRFClassifier = None
         
         # Calibration settings - defaults to always calibrate
         self.calibration_method = 'isotonic'  # Default: 'isotonic', can be 'platt' or None to disable
@@ -231,12 +231,10 @@ class SignalBlender(BlenderBase):
         self.sharpening_alpha = 2.0  # Post-hoc sharpening: prob = prob ** alpha (default: 2.0)
         
         if self.use_gpu:
-            print("[SignalBlender] GPU lightweight model enabled (reduced VRAM).")
+            self._cudf, self._cuRFClassifier = self._require_cuml()
+            print("[GPU] cuML enabled for SignalBlender")
         else:
-            if use_gpu:
-                print("[SignalBlender] GPU requested but cuML unavailable, will use CPU fallback")
-            else:
-                print("[SignalBlender] CPU mode")
+            print("[CPU] sklearn backend active for SignalBlender")
 
     def fit(
         self, 
@@ -311,19 +309,20 @@ class SignalBlender(BlenderBase):
         
         # GPU: Convert to cuDF for training
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
+            cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
             print(f"[SignalBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
             X_gpu = cudf.from_pandas(X_clean)
             y_gpu = cudf.Series(y_numeric.values, dtype='int32')
-            
+
             # Initialize and train model on GPU
             self.model = cuRFClassifier(**self.model_params)
             self.model.fit(X_gpu, y_gpu)
-            
+
             print(f"[SignalBlender] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
-            # CPU fallback: Use scikit-learn GradientBoostingClassifier
             from sklearn.ensemble import GradientBoostingClassifier
-            print("[SignalBlender] Using CPU fallback (scikit-learn GradientBoostingClassifier)")
+            print("[CPU] sklearn backend active for SignalBlender")
             self.model = GradientBoostingClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -390,6 +389,8 @@ class SignalBlender(BlenderBase):
                 # Retrain on the 80% split (more accurate calibration)
                 print(f"[SignalBlender] Retraining on 80% split ({len(X_train_cal)} samples)...")
                 if self.use_gpu:
+                    cudf = self._cudf or self._require_cuml()[0]
+                    cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
                     X_train_gpu = cudf.from_pandas(X_train_cal)
                     y_train_gpu = cudf.Series(y_train_cal.values, dtype='int32')
                     self.model = cuRFClassifier(**self.model_params)
@@ -441,6 +442,7 @@ class SignalBlender(BlenderBase):
         
         # GPU: Convert to cuDF and predict
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             predictions_numeric_gpu = self.model.predict(X_gpu)
             # Convert back to pandas
@@ -498,6 +500,7 @@ class SignalBlender(BlenderBase):
         
         # GPU: Convert to cuDF and predict probabilities
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             proba_gpu = self.model.predict_proba(X_gpu)
             # Convert back to pandas
@@ -590,12 +593,19 @@ class SignalBlender(BlenderBase):
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
-        if saved_use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None):
-            self.use_gpu = True
-            print("[SignalBlender] Model loaded (was trained on GPU, will use GPU for inference)")
+        if saved_use_gpu and self.use_gpu:
+            try:
+                self._cudf, self._cuRFClassifier = self._require_cuml()
+                print("[GPU] cuML enabled for SignalBlender (loaded)")
+            except Exception as exc:
+                print(f"[CPU] SignalBlender trained on GPU but cuML unavailable at load time, falling back to CPU: {exc}")
+                self.use_gpu = False
+                print("[CPU] sklearn backend active for SignalBlender (loaded)")
         else:
+            if saved_use_gpu and not self.use_gpu:
+                print("[CPU] SignalBlender trained on GPU, running with CPU backend per configuration")
             self.use_gpu = False
-            print("[SignalBlender] Model loaded (CPU mode)")
+            print("[CPU] sklearn backend active for SignalBlender (loaded)")
         
         # Restore calibration settings
         self.calibration_method = model_data.get('calibration_method', None)
@@ -615,7 +625,7 @@ class DirectionBlender(BlenderBase):
     Predicts only direction (1 for long, -1 for short) on trade samples (excludes flat/0).
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = True):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
         """
         Initialize direction blender.
         
@@ -637,12 +647,14 @@ class DirectionBlender(BlenderBase):
                 'random_state': 42
             }
         self.model_params = model_params
-        self.use_gpu = use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None)
-        self.model: Optional[cuRFClassifier] = None
+        self.use_gpu = use_gpu
+        self.model = None
         self.direction_classes = [-1, 1]  # short, long (binary, no flat)
         self.feature_names = []
         self.feature_importances_ = None  # Will be populated after training
         self.name = "DirectionBlender"  # For saving feature importances
+        self._cudf = None
+        self._cuRFClassifier = None
         
         # Calibration settings - defaults to always calibrate
         self.calibration_method = 'isotonic'  # Default: 'isotonic', can be 'platt' or None to disable
@@ -650,12 +662,10 @@ class DirectionBlender(BlenderBase):
         self.sharpening_alpha = 2.0  # Post-hoc sharpening: prob = prob ** alpha (default: 2.0)
         
         if self.use_gpu:
-            print("[DirectionBlender] GPU lightweight model enabled (reduced VRAM).")
+            self._cudf, self._cuRFClassifier = self._require_cuml()
+            print("[GPU] cuML enabled for DirectionBlender")
         else:
-            if use_gpu:
-                print("[DirectionBlender] GPU requested but cuML unavailable, will use CPU fallback")
-            else:
-                print("[DirectionBlender] CPU mode")
+            print("[CPU] sklearn backend active for DirectionBlender")
 
     def fit(
         self, 
@@ -729,19 +739,20 @@ class DirectionBlender(BlenderBase):
         
         # GPU: Convert to cuDF for training
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
+            cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
             print(f"[DirectionBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
             X_gpu = cudf.from_pandas(X_clean)
             y_gpu = cudf.Series(y_numeric.values, dtype='int32')
-            
+
             # Initialize and train model on GPU
             self.model = cuRFClassifier(**self.model_params)
             self.model.fit(X_gpu, y_gpu)
-            
+
             print(f"[DirectionBlender] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
-            # CPU fallback: Use scikit-learn GradientBoostingClassifier
             from sklearn.ensemble import GradientBoostingClassifier
-            print("[DirectionBlender] Using CPU fallback (scikit-learn GradientBoostingClassifier)")
+            print("[CPU] sklearn backend active for DirectionBlender")
             self.model = GradientBoostingClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -808,6 +819,8 @@ class DirectionBlender(BlenderBase):
                 # Retrain on the 80% split (more accurate calibration)
                 print(f"[DirectionBlender] Retraining on 80% split ({len(X_train_cal)} samples)...")
                 if self.use_gpu:
+                    cudf = self._cudf or self._require_cuml()[0]
+                    cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
                     X_train_gpu = cudf.from_pandas(X_train_cal)
                     y_train_gpu = cudf.Series(y_train_cal.values, dtype='int32')
                     self.model = cuRFClassifier(**self.model_params)
@@ -879,6 +892,7 @@ class DirectionBlender(BlenderBase):
         
         # GPU: Convert to cuDF and predict
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             predictions_numeric_gpu = self.model.predict(X_gpu)
             # Convert back to pandas
@@ -936,6 +950,7 @@ class DirectionBlender(BlenderBase):
         
         # GPU: Convert to cuDF and predict probabilities
         if self.use_gpu:
+            cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
             proba_gpu = self.model.predict_proba(X_gpu)
             # Convert back to pandas
@@ -1009,12 +1024,14 @@ class DirectionBlender(BlenderBase):
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
-        if saved_use_gpu and GPU_AVAILABLE and (cuRFClassifier is not None):
-            self.use_gpu = True
-            print("[DirectionBlender] Model loaded (was trained on GPU, will use GPU for inference)")
+        if saved_use_gpu and self.use_gpu:
+            self._cudf, self._cuRFClassifier = self._require_cuml()
+            print("[GPU] cuML enabled for DirectionBlender (loaded)")
         else:
+            if saved_use_gpu and not self.use_gpu:
+                print("[CPU] DirectionBlender trained on GPU, running with CPU backend per configuration")
             self.use_gpu = False
-            print("[DirectionBlender] Model loaded (CPU mode)")
+            print("[CPU] sklearn backend active for DirectionBlender (loaded)")
         
         # Restore calibration settings
         self.calibration_method = model_data.get('calibration_method', None)

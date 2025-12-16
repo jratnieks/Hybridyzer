@@ -670,7 +670,8 @@ def train_full_pipeline(
     sharpening_alpha: float = 2.0,
     prune_bottom_percentile: float = 20.0,
     models_dir: Path = Path("models"),
-    results_dir: Path = Path("results")
+    results_dir: Path = Path("results"),
+    use_gpu: bool = False,
 ) -> Tuple:
     """
     Full training pipeline with feature pruning, importance analysis, and diagnostics.
@@ -722,7 +723,7 @@ def train_full_pipeline(
     
     # 2. Initial training
     print(f"\n[2/7] Initial training...")
-    model = model_class(use_gpu=True)
+    model = model_class(use_gpu=use_gpu)
     model.fit(
         X_train, y_train,
         calibration_method=calibration_method,
@@ -790,7 +791,7 @@ def train_full_pipeline(
         )
         print(f"[{model_name}] Using {len(X_val_pruned_cal)} samples for calibration (downsampled from {len(X_val_pruned)}).")
         
-        model_pruned = model_class(use_gpu=True)
+        model_pruned = model_class(use_gpu=use_gpu)
         model_pruned.fit(
             X_train_pruned, y_train,
             calibration_method=calibration_method,
@@ -1131,7 +1132,7 @@ def main():
     print("FEATURE SCALING")
     print("="*60)
     # Use ZScoreScaler by default (can be changed to MinMaxScaler or RobustScaler)
-    scaler = ZScoreScaler(use_gpu=True)
+    scaler = ZScoreScaler(use_gpu=use_cuml)
     print(f"Initialized {scaler.__class__.__name__}")
     
     print("Fitting scaler on training data (X_regime_train)...")
@@ -1171,7 +1172,7 @@ def main():
     print("TRAINING REGIME DETECTOR")
     print("="*60)
     print(f"Training on {len(X_regime_train)} samples...")
-    regime_detector = RegimeDetector(use_gpu=True)  # GPU-accelerated training
+    regime_detector = RegimeDetector(use_gpu=use_cuml)  # GPU-accelerated training
     regime_detector.fit(X_regime_train_scaled, y_regime_train)  # Train on scaled training set only
     
     # Validate on validation set
@@ -1225,7 +1226,7 @@ def main():
     else:
         # Legacy training path
         print(f"Training on {len(X_blend_train)} samples...")
-        signal_blender = SignalBlender(use_gpu=True)  # GPU-accelerated training
+        signal_blender = SignalBlender(use_gpu=use_cuml)  # GPU-accelerated training
         signal_blender.fit(
             X_blend_train_scaled, 
             y_blend_train,
@@ -1357,7 +1358,7 @@ def main():
     else:
         # Legacy training path
         print(f"\nTraining DirectionBlender on {len(X_blend_trade_train)} trade samples...")
-        direction_blender = DirectionBlender(use_gpu=True)  # GPU-accelerated training
+        direction_blender = DirectionBlender(use_gpu=use_cuml)  # GPU-accelerated training
         direction_blender.fit(
             X_blend_trade_train, 
             y_direction_train,
@@ -1476,7 +1477,7 @@ def main():
             'n_streams': 4,
             'random_state': 42
         }
-        model_r = SignalBlender(model_params=model_params, use_gpu=True)
+        model_r = SignalBlender(model_params=model_params, use_gpu=use_cuml)
         
         print(f"Training SignalBlender[{regime_name}]...")
         model_r.fit(
@@ -1565,7 +1566,7 @@ def main():
             'n_streams': 4,
             'random_state': 42
         }
-        model_r = DirectionBlender(model_params=model_params, use_gpu=True)
+        model_r = DirectionBlender(model_params=model_params, use_gpu=use_cuml)
         
         print(f"Training DirectionBlender[{regime_name}]...")
         model_r.fit(
