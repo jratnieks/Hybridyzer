@@ -910,6 +910,8 @@ def main():
                         help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
     parser.add_argument('--runpod', action='store_true',
                         help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
+    parser.add_argument('--cpu-only', action='store_true',
+                        help='Force CPU even if cuML is installed')
     args = parser.parse_args()
 
     # Configuration
@@ -921,6 +923,21 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
+    
+    # GPU detection: check for cuML availability
+    try:
+        import cudf  # noqa: F401
+        import cuml  # noqa: F401
+        gpu_available = True
+    except ImportError:
+        gpu_available = False
+    
+    if args.cpu_only:
+        use_cuml = False
+        print("[GPU] cpu_only flag set: forcing CPU backend")
+    else:
+        use_cuml = gpu_available
+        print(f"[GPU] cuML available: {use_cuml}")
     
     # Calibration settings - defaults to always calibrate
     if args.disable_calibration:
@@ -1221,7 +1238,8 @@ def main():
                 calibration_method=calibration_method,
                 sharpening_alpha=sharpening_alpha,
                 models_dir=models_dir,
-                results_dir=results_dir
+                results_dir=results_dir,
+                use_gpu=use_cuml
             )
     else:
         # Legacy training path
@@ -1353,7 +1371,8 @@ def main():
             calibration_method=calibration_method,
             sharpening_alpha=sharpening_alpha,
             models_dir=models_dir,
-            results_dir=results_dir
+            results_dir=results_dir,
+            use_gpu=use_cuml
         )
     else:
         # Legacy training path
