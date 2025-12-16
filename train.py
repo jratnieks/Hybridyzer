@@ -906,15 +906,11 @@ def main():
     parser.add_argument('--label-threshold', type=float, default=0.0005,
                         help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
     parser.add_argument('--runpod', action='store_true',
-                        help='Use RunPod workspace layout for data, models, and results')
+                        help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     args = parser.parse_args()
 
     # Configuration
-    # Derive the project base from this file location to avoid hard-coded paths
-    # and remain case-safe across local and RunPod environments. The --runpod
-    # flag is retained for compatibility but no longer required for correct
-    # path resolution.
-    base_dir = Path(__file__).resolve().parent
+    base_dir = Path("/workspace/Hybridyzer") if args.runpod else Path.cwd()
     base_dir.mkdir(parents=True, exist_ok=True)
     data_dir = base_dir / "data"
     models_dir = base_dir / "models"
@@ -922,9 +918,6 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[Paths] base_dir resolved to: {base_dir}")
-    print(f"[Paths] data_dir resolved to: {data_dir}")
     
     # Calibration settings - defaults to always calibrate
     if args.disable_calibration:
@@ -946,18 +939,31 @@ def main():
     
     # 1. Load BTC data with load_btc_csv
     print("Loading BTC CSV data...")
-    csv_files = list(data_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError("No CSV files found in data/ directory")
-
-    # Prefer granular files (1min/5min) when available; otherwise use the largest CSV
-    preferred = [p for p in csv_files if "1min" in p.name.lower() or "5min" in p.name.lower()]
-    target_csv = max(preferred if preferred else csv_files, key=lambda p: p.stat().st_size)
-
-    # Resolve to an absolute path to avoid ambiguity when multiple data roots exist
-    target_csv_resolved = target_csv.resolve()
-    df = load_btc_csv(str(target_csv_resolved))
-    print(f"Selected CSV: {target_csv_resolved} ({len(df)} rows)")
+    # Prefer 4H data for faster experimentation, then fall back to 1m
+    csv_paths = [
+        data_dir / 'btcusd_4H.csv',           # 4-hour data (small, fast)
+        data_dir / 'btcusd_1min.csv',         # 1-minute data (large)
+        data_dir / 'btc_1m.csv',
+        data_dir / 'btcusd_1min_volspikes.csv',
+        data_dir / 'btc_data.csv',
+    ]
+    df = None
+    for path in csv_paths:
+        try:
+            df = load_btc_csv(str(path))
+            print(f"Loaded from: {path}")
+            break
+        except FileNotFoundError:
+            continue
+    
+    if df is None:
+        # Try to find any CSV in data directory
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            df = load_btc_csv(str(csv_files[0]))
+            print(f"Loaded from: {csv_files[0]}")
+        else:
+            raise FileNotFoundError("No CSV files found in data/ directory")
     
     if df.empty:
         print("Error: No data loaded.")
