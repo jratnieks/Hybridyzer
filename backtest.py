@@ -319,6 +319,8 @@ def main():
                         help='Disable GPU acceleration for feature generation (use CPU only)')
     parser.add_argument('--chunk-size', type=int, default=100000,
                         help='Chunk size for GPU processing (default: 100000, reduce to 50000 if OOM)')
+    parser.add_argument('--runpod', action='store_true',
+                        help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     args = parser.parse_args()
     
     # Load profile if specified (STRICT: exit if not found)
@@ -377,7 +379,8 @@ def main():
     print(f"  total round-trip: {total_cost_bps} bps ({total_cost_bps/100:.2f}%)")
     print("="*60 + "\n")
     
-    base_dir = Path(__file__).resolve().parent
+    base_dir = Path("/workspace/Hybridyzer") if args.runpod else Path.cwd()
+    base_dir.mkdir(parents=True, exist_ok=True)
     data_dir = base_dir / "data"
     models_dir = base_dir / "models"
     results_dir = base_dir / "results"
