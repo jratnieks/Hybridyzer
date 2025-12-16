@@ -347,11 +347,11 @@ def validate_one_window(
 
 def build_features_once(
     df: pd.DataFrame,
-    feature_store: FeatureStore,
     signal_modules: List,
     context_modules: List,
     cache_path: Path,
     force_recompute: bool = False,
+    use_gpu: bool = False,
 ) -> Tuple[FeatureStore, pd.DataFrame]:
     """
     Compute all features exactly once, cache to Parquet, and reuse for slicing.
@@ -360,6 +360,7 @@ def build_features_once(
     walk-forward loop only slices cached features instead of rebuilding per
     window.
     """
+    feature_store = FeatureStore(use_gpu=use_gpu)
     cached_features = feature_store.build_and_cache(
         df,
         signal_modules,
@@ -480,11 +481,11 @@ def combined_training(
     cache_path = feature_cache_path or (models_dir / "cached_features.parquet")
     feature_store, cached_features = build_features_once(
         df,
-        feature_store,
         signal_modules,
         context_modules,
         cache_path,
         force_recompute=force_recompute_cache,
+        use_gpu=False,
     )
 
     # Generate splits
@@ -906,30 +907,20 @@ def main():
     parser.add_argument('--horizon-bars', type=int, default=48,
                         help='Forward horizon in bars for label generation (default: 48 = 4 hours for 5-min data)')
     parser.add_argument('--label-threshold', type=float, default=0.0005,
-                        help='Threshold for direction labels (default: 0.0005 = 0.05%)')
-    parser.add_argument('--use-cuml', action='store_true',
-                        help='Enable cuML/cuDF GPU models (requires RAPIDS; fails if unavailable)')
+                        help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
+    parser.add_argument('--runpod', action='store_true',
+                        help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     args = parser.parse_args()
 
     # Configuration
-    # Derive the project base from this file location to avoid hard-coded paths
-    # and remain case-safe across local and RunPod environments.
-    base_dir = Path(__file__).resolve().parent
+    base_dir = Path("/workspace/Hybridyzer") if args.runpod else Path.cwd()
+    base_dir.mkdir(parents=True, exist_ok=True)
     data_dir = base_dir / "data"
     models_dir = base_dir / "models"
     results_dir = base_dir / "results"
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[Paths] base_dir resolved to: {base_dir}")
-    print(f"[Paths] data_dir resolved to: {data_dir}")
-
-    use_cuml = args.use_cuml
-    if use_cuml:
-        print("[GPU] cuML requested via --use-cuml")
-    else:
-        print("[CPU] sklearn backend active (no --use-cuml)")
     
     # Calibration settings - defaults to always calibrate
     if args.disable_calibration:
@@ -951,18 +942,31 @@ def main():
     
     # 1. Load BTC data with load_btc_csv
     print("Loading BTC CSV data...")
-    csv_files = list(data_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError("No CSV files found in data/ directory")
-
-    # Prefer granular files (1min/5min) when available; otherwise use the largest CSV
-    preferred = [p for p in csv_files if "1min" in p.name.lower() or "5min" in p.name.lower()]
-    target_csv = max(preferred if preferred else csv_files, key=lambda p: p.stat().st_size)
-
-    # Resolve to an absolute path to avoid ambiguity when multiple data roots exist
-    target_csv_resolved = target_csv.resolve()
-    df = load_btc_csv(str(target_csv_resolved))
-    print(f"Selected CSV: {target_csv_resolved} ({len(df)} rows)")
+    # Prefer 4H data for faster experimentation, then fall back to 1m
+    csv_paths = [
+        data_dir / 'btcusd_4H.csv',           # 4-hour data (small, fast)
+        data_dir / 'btcusd_1min.csv',         # 1-minute data (large)
+        data_dir / 'btc_1m.csv',
+        data_dir / 'btcusd_1min_volspikes.csv',
+        data_dir / 'btc_data.csv',
+    ]
+    df = None
+    for path in csv_paths:
+        try:
+            df = load_btc_csv(str(path))
+            print(f"Loaded from: {path}")
+            break
+        except FileNotFoundError:
+            continue
+    
+    if df is None:
+        # Try to find any CSV in data directory
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            df = load_btc_csv(str(csv_files[0]))
+            print(f"Loaded from: {csv_files[0]}")
+        else:
+            raise FileNotFoundError("No CSV files found in data/ directory")
     
     if df.empty:
         print("Error: No data loaded.")
@@ -972,22 +976,14 @@ def main():
     
     # 2. Build or load cached features once to avoid recomputation across runs
     cache_path = models_dir / "cached_features.parquet"
-    feature_store = FeatureStore(use_gpu=False)
-    # Ensure the same FeatureStore instance defines modules and owns cached feature building
-    signal_modules = feature_store.signal_modules
-    context_modules = feature_store.context_modules
+    feature_store = FeatureStore()
     feature_store, feats = build_features_once(
         df,
-        feature_store=feature_store,
-        signal_modules=signal_modules,
-        context_modules=context_modules,
+        signal_modules=feature_store.signal_modules,
+        context_modules=feature_store.context_modules,
         cache_path=cache_path,
+        use_gpu=False,
     )
-
-    # Cached features must remain perfectly aligned to the raw price index to
-    # avoid silent label/feature skew.
-    if not feats.index.equals(df.index):
-        raise ValueError("Cached feature index mismatch with raw data index")
     print(f"[Features] Loaded cached features: {feats.shape}")
     
     # Print final feature columns for verification
@@ -1225,8 +1221,7 @@ def main():
                 calibration_method=calibration_method,
                 sharpening_alpha=sharpening_alpha,
                 models_dir=models_dir,
-                results_dir=results_dir,
-                use_gpu=use_cuml,
+                results_dir=results_dir
             )
     else:
         # Legacy training path
@@ -1358,8 +1353,7 @@ def main():
             calibration_method=calibration_method,
             sharpening_alpha=sharpening_alpha,
             models_dir=models_dir,
-            results_dir=results_dir,
-            use_gpu=use_cuml,
+            results_dir=results_dir
         )
     else:
         # Legacy training path
