@@ -447,6 +447,7 @@ def validate_models_for_window(
 
 def combined_training(
     df: pd.DataFrame,
+    feature_store: FeatureStore,
     signal_modules: List,
     context_modules: List,
     models_dir: Path,
@@ -463,6 +464,7 @@ def combined_training(
     
     Args:
         df: Full dataset
+        feature_store: Shared FeatureStore instance for feature caching/slicing
         signal_modules: List of signal modules
         context_modules: List of context modules
         models_dir: Directory to save models

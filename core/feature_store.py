@@ -1619,10 +1619,10 @@ class FeatureStore:
         
         # Replace inf with NaN
         cleaned = cleaned.replace([np.inf, -np.inf], np.nan)
-        
+
         # Fill NaN with forward fill, then backward fill, then 0
         cleaned = cleaned.fillna(method='ffill').fillna(method='bfill').fillna(0)
-        
+
         # Ensure numeric types
         for col in cleaned.columns:
             if cleaned[col].dtype == 'object':

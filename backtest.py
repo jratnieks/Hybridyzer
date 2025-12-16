@@ -9,11 +9,6 @@ import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 import argparse
-from modules.superma import SuperMA4hr
-from modules.trendmagic import TrendMagicV2
-from modules.pvt_eliminator import PVTEliminator
-from modules.pivots_rsi import PivotRSIContext
-from modules.linreg_channel import LinRegChannelContext
 from core.feature_store import FeatureStore
 from core.regime_detector import RegimeDetector
 from core.signal_blender import SignalBlender, DirectionBlender
@@ -426,22 +421,14 @@ def main():
         chunk_size=args.chunk_size
     )
     
-    # Initialize modules (same as train.py)
-    signal_modules = [
-        SuperMA4hr(),
-        TrendMagicV2(),
-        PVTEliminator()
-    ]
-    context_modules = [
-        PivotRSIContext(),
-        LinRegChannelContext()
-    ]
-    
-    feature_store.signal_modules = signal_modules
-    feature_store.context_modules = context_modules
+    # Use the FeatureStore's own module definitions to match training exactly
+    signal_modules = feature_store.signal_modules
+    context_modules = feature_store.context_modules
     
     features_full = feature_store.build(df_full)
     print(f"Built {features_full.shape[1]} features for {len(features_full)} bars")
+    # Print final feature columns to verify parity with training
+    print("\nFINAL FEATURE COLUMNS:", features_full.columns.tolist())
     
     # 3. Load trained models
     regime_model_path = models_dir / "regime_model.pkl"
