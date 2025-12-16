@@ -9,11 +9,6 @@ import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 import argparse
-from modules.superma import SuperMA4hr
-from modules.trendmagic import TrendMagicV2
-from modules.pvt_eliminator import PVTEliminator
-from modules.pivots_rsi import PivotRSIContext
-from modules.linreg_channel import LinRegChannelContext
 from core.feature_store import FeatureStore
 from core.regime_detector import RegimeDetector
 from core.signal_blender import SignalBlender, DirectionBlender
@@ -382,24 +377,31 @@ def main():
     print(f"  total round-trip: {total_cost_bps} bps ({total_cost_bps/100:.2f}%)")
     print("="*60 + "\n")
     
+    base_dir = Path(__file__).resolve().parent
+    data_dir = base_dir / "data"
+    models_dir = base_dir / "models"
+    results_dir = base_dir / "results"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
     # 1. Load raw BTC CSV
     print("Loading BTC data...")
     csv_paths = [
-        "data/btcusd_4H.csv",
-        "data/btcusd_1min.csv",
-        "data/btc_1m.csv",
+        data_dir / "btcusd_4H.csv",
+        data_dir / "btcusd_1min.csv",
+        data_dir / "btc_1m.csv",
     ]
     
     df_full = None
     for path in csv_paths:
         if Path(path).exists():
-            df_full = load_btc_csv(path)
+            df_full = load_btc_csv(str(path))
             print(f"Loaded {len(df_full)} bars from {path}")
             break
-    
+
     if df_full is None:
         # Try to find any CSV in data directory
-        data_dir = Path("data")
         csv_files = list(data_dir.glob("*.csv"))
         if csv_files:
             df_full = load_btc_csv(str(csv_files[0]))
@@ -416,25 +418,16 @@ def main():
         chunk_size=args.chunk_size
     )
     
-    # Initialize modules (same as train.py)
-    signal_modules = [
-        SuperMA4hr(),
-        TrendMagicV2(),
-        PVTEliminator()
-    ]
-    context_modules = [
-        PivotRSIContext(),
-        LinRegChannelContext()
-    ]
-    
-    feature_store.signal_modules = signal_modules
-    feature_store.context_modules = context_modules
+    # Use the FeatureStore's own module definitions to match training exactly
+    signal_modules = feature_store.signal_modules
+    context_modules = feature_store.context_modules
     
     features_full = feature_store.build(df_full)
     print(f"Built {features_full.shape[1]} features for {len(features_full)} bars")
+    # Print final feature columns to verify parity with training
+    print("\nFINAL FEATURE COLUMNS:", features_full.columns.tolist())
     
     # 3. Load trained models
-    models_dir = Path("models")
     regime_model_path = models_dir / "regime_model.pkl"
     blender_model_path = models_dir / "blender_model.pkl"
     direction_model_path = models_dir / "blender_direction_model.pkl"
@@ -522,7 +515,6 @@ def main():
     calibration_csv = args.calibration_csv
     if calibration_csv is None:
         # Try to find a calibration file in results directory
-        results_dir = Path("results")
         if results_dir.exists():
             # Look for overall calibration files
             cal_files = sorted(results_dir.glob("calibration_overall*.csv"), reverse=True)
@@ -982,10 +974,6 @@ def main():
                 print(f"\n  ({regime}, {side}):")
                 print(group[['prob_bin', 'count', 'hit_rate', 'avg_gross_return', 'median_gross_return', 'avg_abs_return']].to_string(index=False))
     
-    # Save calibration CSV
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    
     # Build suffix for calibration filename
     cal_suffix_parts = []
     if p_long is not None:
@@ -1033,9 +1021,6 @@ def main():
     
     # 14. Plot equity curve
     print("\nPlotting equity curve...")
-    results_dir = Path("results")
-    results_dir.mkdir(exist_ok=True)
-    
     # Build suffix for result filenames based on args
     suffix_parts = []
     if prob_threshold is not None:
