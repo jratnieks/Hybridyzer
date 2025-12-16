@@ -939,16 +939,31 @@ def main():
     
     # 1. Load BTC data with load_btc_csv
     print("Loading BTC CSV data...")
-    csv_files = list(data_dir.glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError("No CSV files found in data/ directory")
-
-    # Prefer granular files (1min/5min) when available; otherwise use the largest CSV
-    preferred = [p for p in csv_files if "1min" in p.name.lower() or "5min" in p.name.lower()]
-    target_csv = max(preferred if preferred else csv_files, key=lambda p: p.stat().st_size)
-
-    df = load_btc_csv(str(target_csv))
-    print(f"Selected CSV: {target_csv} ({len(df)} rows)")
+    # Prefer 4H data for faster experimentation, then fall back to 1m
+    csv_paths = [
+        data_dir / 'btcusd_4H.csv',           # 4-hour data (small, fast)
+        data_dir / 'btcusd_1min.csv',         # 1-minute data (large)
+        data_dir / 'btc_1m.csv',
+        data_dir / 'btcusd_1min_volspikes.csv',
+        data_dir / 'btc_data.csv',
+    ]
+    df = None
+    for path in csv_paths:
+        try:
+            df = load_btc_csv(str(path))
+            print(f"Loaded from: {path}")
+            break
+        except FileNotFoundError:
+            continue
+    
+    if df is None:
+        # Try to find any CSV in data directory
+        csv_files = list(data_dir.glob("*.csv"))
+        if csv_files:
+            df = load_btc_csv(str(csv_files[0]))
+            print(f"Loaded from: {csv_files[0]}")
+        else:
+            raise FileNotFoundError("No CSV files found in data/ directory")
     
     if df.empty:
         print("Error: No data loaded.")
