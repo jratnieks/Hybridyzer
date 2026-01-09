@@ -9,6 +9,7 @@ from modules.trendmagic import TrendMagicV2
 from modules.pvt_eliminator import PVTEliminator
 from modules.pivots_rsi import PivotRSIContext
 from modules.linreg_channel import LinRegChannelContext
+from modules.ohlcv_context import OHLCVContext
 from core.hybrid_engine import HybridEngine
 from data.btc_data_loader import BTCDataLoader
 
@@ -20,14 +21,13 @@ def main():
     # Initialize data loader
     data_loader = BTCDataLoader()
     
-    # TODO: Load data
-    # df = data_loader.load_data(start_date="2024-01-01", end_date="2024-12-31")
-    
-    # For now, create placeholder dataframe
-    df = pd.DataFrame()
-    
-    if df.empty:
-        print("Warning: No data loaded. Please implement data loading in btc_data_loader.py")
+    # Load data from available CSV file
+    try:
+        df = data_loader.load_data()
+        print(f"Loaded {len(df)} rows of data")
+        print(f"Date range: {df.index.min()} to {df.index.max()}")
+    except Exception as e:
+        print(f"Error loading data: {e}")
         return
     
     # Initialize signal modules (produce signals)
@@ -41,6 +41,7 @@ def main():
     context_modules = [
         PivotRSIContext(),
         LinRegChannelContext(),
+        OHLCVContext(),
     ]
     
     # Initialize hybrid engine
@@ -60,4 +61,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

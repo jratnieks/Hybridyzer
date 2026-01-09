@@ -5,12 +5,19 @@ Supports walk-forward training with 6-month training windows and 1-month validat
 """
 
 from __future__ import annotations
-import pandas as pd
-import numpy as np
+import argparse
+import atexit
+import faulthandler
+import json
+import os
+import random
+import sys
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
-from datetime import timedelta
-import argparse
+import pandas as pd
+import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix
 
 
@@ -27,11 +34,384 @@ def _print_probability_distribution(proba: np.ndarray, label: str) -> None:
     total = len(proba)
     
     print(f"  {label}:")
-    print(f"    Mean: {proba.mean():.4f}, Median: {proba.median():.4f}")
+    print(f"    Mean: {proba.mean():.4f}, Median: {np.median(proba):.4f}")
     print(f"    Distribution by bin:")
     for i in range(len(bins) - 1):
         pct = counts[i] / total * 100 if total > 0 else 0
         print(f"      [{bins[i]:.1f}, {bins[i+1]:.1f}): {counts[i]:6d} ({pct:5.2f}%)")
+
+
+def _fmt_optional(value: Optional[float], decimals: int = 4) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+            return "n/a"
+    except Exception:
+        return "n/a"
+    return f"{value:.{decimals}f}"
+
+
+class _Tee:
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> None:
+        for stream in self._streams:
+            stream.write(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
+def _setup_logging(log_path: Path) -> Tuple[object, object, object]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8")
+    stdout = sys.stdout
+    stderr = sys.stderr
+    sys.stdout = _Tee(sys.stdout, log_file)
+    sys.stderr = _Tee(sys.stderr, log_file)
+
+    def _cleanup() -> None:
+        sys.stdout = stdout
+        sys.stderr = stderr
+        log_file.close()
+    atexit.register(_cleanup)
+    return log_file, stdout, stderr
+
+
+def _json_default(obj: object) -> object:
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (np.integer, np.floating)):
+        return obj.item()
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    return str(obj)
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, default=_json_default)
+
+
+def set_global_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def build_regime_labels(
+    df: pd.DataFrame,
+    features: pd.DataFrame,
+    strategy: str
+) -> pd.Series:
+    if strategy == "rule":
+        labels = rule_based_regime(features, df)
+    elif strategy == "indicator":
+        labels = make_regime_labels(df)
+    else:
+        raise ValueError(f"Unknown regime label strategy: {strategy}")
+    return labels.reindex(features.index)
+
+
+def compute_return_metrics(
+    predictions: pd.Series,
+    close: pd.Series,
+    horizon_bars: int,
+    eval_mode: str = "nonoverlap",
+    transaction_cost_bps: float = 0.0
+) -> Dict[str, object]:
+    """
+    Compute return metrics using either non-overlapping horizon trades or per-bar returns.
+
+    Args:
+        predictions: Series of signals (-1, 0, 1)
+        close: Close price series
+        horizon_bars: Forward horizon for non-overlap evaluation
+        eval_mode: "nonoverlap" or "per-bar"
+        transaction_cost_bps: Cost per side in basis points
+    """
+    def _drawdown_stats(returns: pd.Series) -> Tuple[float, int]:
+        if returns.empty:
+            return 0.0, 0
+        equity = (1.0 + returns).cumprod()
+        running_max = equity.cummax()
+        drawdown = equity / running_max - 1.0
+        max_drawdown = float(drawdown.min())
+        max_duration = 0
+        current = 0
+        for value in drawdown:
+            if value == 0:
+                if current > max_duration:
+                    max_duration = current
+                current = 0
+            else:
+                current += 1
+        if current > max_duration:
+            max_duration = current
+        return max_drawdown, int(max_duration)
+
+    def _trade_metrics(trade_returns: pd.Series) -> Dict[str, Optional[float]]:
+        if trade_returns.empty:
+            return {
+                "win_rate": 0.0,
+                "avg_trade_return": 0.0,
+                "profit_factor": 0.0,
+                "expectancy": 0.0,
+                "avg_win": 0.0,
+                "avg_loss": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0
+            }
+        wins = trade_returns[trade_returns > 0]
+        losses = trade_returns[trade_returns < 0]
+        gross_profit = float(wins.sum()) if not wins.empty else 0.0
+        gross_loss = float(losses.sum()) if not losses.empty else 0.0
+        avg_win = float(wins.mean()) if not wins.empty else 0.0
+        avg_loss = float(losses.mean()) if not losses.empty else 0.0
+        win_rate = float((trade_returns > 0).mean())
+        expectancy = float(win_rate * avg_win + (1.0 - win_rate) * avg_loss)
+        profit_factor = None
+        if gross_loss < 0.0:
+            profit_factor = float(gross_profit / abs(gross_loss))
+        elif gross_profit == 0.0:
+            profit_factor = 0.0
+        return {
+            "win_rate": win_rate,
+            "avg_trade_return": float(trade_returns.mean()),
+            "profit_factor": profit_factor,
+            "expectancy": expectancy,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss
+        }
+
+    def _trade_returns_from_positions(
+        preds: pd.Series,
+        prices: pd.Series,
+        cost_per_side: float
+    ) -> pd.Series:
+        trade_returns = []
+        position = 0
+        entry_price = None
+        for pos, price in zip(preds, prices):
+            pos = int(pos)
+            if not np.isfinite(price):
+                continue
+            if position == 0:
+                if pos != 0 and price != 0:
+                    position = pos
+                    entry_price = price
+                continue
+            if pos == position:
+                continue
+            if entry_price is not None and entry_price != 0 and price != 0:
+                raw_return = (price / entry_price - 1.0) * position
+                cost = 2.0 * cost_per_side if cost_per_side else 0.0
+                trade_returns.append(raw_return - cost)
+            position = pos
+            if pos != 0 and price != 0:
+                entry_price = price
+            else:
+                entry_price = None
+        return pd.Series(trade_returns)
+    if close.empty or predictions.empty:
+        return {
+            "eval_mode": eval_mode,
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "total_cost": 0.0,
+            "samples": 0,
+            "trade_count": 0,
+            "trade_rate": 0.0,
+            "turnover": 0.0,
+            "cumulative_return": 0.0,
+            "gross_cumulative_return": 0.0,
+            "gross_mean_return": 0.0,
+            "gross_volatility": 0.0,
+            "gross_sharpe_like": 0.0,
+            "cost_impact": 0.0,
+            "mean_return": 0.0,
+            "volatility": 0.0,
+            "sharpe_like": 0.0,
+            "win_rate": 0.0,
+            "avg_trade_return": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_duration": 0
+        }
+
+    preds = predictions.reindex(close.index).fillna(0).astype(int)
+    close = close.reindex(preds.index)
+    cost_per_side = max(0.0, float(transaction_cost_bps)) / 10000.0
+
+    if eval_mode == "per-bar":
+        bar_returns = close.pct_change().shift(-1)
+        valid_mask = ~bar_returns.isna()
+        preds = preds[valid_mask]
+        bar_returns = bar_returns[valid_mask]
+        close = close.reindex(preds.index)
+
+        delta = preds.diff().fillna(preds.iloc[0])
+        costs = delta.abs() * cost_per_side
+        gross_signal_returns = preds * bar_returns
+        signal_returns = gross_signal_returns - costs
+
+        trade_returns = _trade_returns_from_positions(preds, close, cost_per_side)
+        trade_count = int(len(trade_returns))
+        trade_rate = float(trade_count / len(preds)) if len(preds) else 0.0
+        turnover = float(delta.abs().sum() / len(preds)) if len(preds) else 0.0
+        trade_stats = _trade_metrics(trade_returns)
+
+        cumulative_return = float((1 + signal_returns).prod() - 1)
+        gross_cumulative_return = float((1 + gross_signal_returns).prod() - 1)
+        mean_return = float(signal_returns.mean())
+        volatility = float(signal_returns.std())
+        sharpe_like = float(mean_return / volatility) if volatility != 0 else 0.0
+        gross_mean_return = float(gross_signal_returns.mean())
+        gross_volatility = float(gross_signal_returns.std())
+        gross_sharpe_like = float(gross_mean_return / gross_volatility) if gross_volatility != 0 else 0.0
+        max_drawdown, max_duration = _drawdown_stats(signal_returns)
+
+        return {
+            "eval_mode": eval_mode,
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "total_cost": float(costs.sum()),
+            "samples": int(len(preds)),
+            "trade_count": trade_count,
+            "trade_rate": trade_rate,
+            "turnover": turnover,
+            "cumulative_return": cumulative_return,
+            "gross_cumulative_return": gross_cumulative_return,
+            "gross_mean_return": gross_mean_return,
+            "gross_volatility": gross_volatility,
+            "gross_sharpe_like": gross_sharpe_like,
+            "cost_impact": float(gross_cumulative_return - cumulative_return),
+            "mean_return": mean_return,
+            "volatility": volatility,
+            "sharpe_like": sharpe_like,
+            "win_rate": trade_stats["win_rate"],
+            "avg_trade_return": trade_stats["avg_trade_return"],
+            "profit_factor": trade_stats["profit_factor"],
+            "expectancy": trade_stats["expectancy"],
+            "avg_win": trade_stats["avg_win"],
+            "avg_loss": trade_stats["avg_loss"],
+            "gross_profit": trade_stats["gross_profit"],
+            "gross_loss": trade_stats["gross_loss"],
+            "max_drawdown": max_drawdown,
+            "max_drawdown_duration": max_duration
+        }
+
+    if eval_mode != "nonoverlap":
+        raise ValueError(f"Unknown eval_mode: {eval_mode}")
+
+    close_vals = close.values
+    n = len(preds)
+    trade_returns = []
+    gross_trade_returns = []
+    i = 0
+    while i + horizon_bars < n:
+        signal = int(preds.iloc[i])
+        if signal == 0:
+            i += 1
+            continue
+
+        entry = close_vals[i]
+        exit_price = close_vals[i + horizon_bars]
+        if not np.isfinite(entry) or not np.isfinite(exit_price) or entry == 0:
+            i += 1
+            continue
+
+        raw_return = (exit_price / entry - 1.0) * signal
+        cost = 2.0 * cost_per_side if cost_per_side else 0.0
+        gross_trade_returns.append(raw_return)
+        trade_returns.append(raw_return - cost)
+        i += horizon_bars
+
+    if not trade_returns:
+        return {
+            "eval_mode": eval_mode,
+            "transaction_cost_bps": float(transaction_cost_bps),
+            "total_cost": 0.0,
+            "samples": 0,
+            "trade_count": 0,
+            "trade_rate": 0.0,
+            "turnover": 0.0,
+            "cumulative_return": 0.0,
+            "gross_cumulative_return": 0.0,
+            "gross_mean_return": 0.0,
+            "gross_volatility": 0.0,
+            "gross_sharpe_like": 0.0,
+            "cost_impact": 0.0,
+            "mean_return": 0.0,
+            "volatility": 0.0,
+            "sharpe_like": 0.0,
+            "win_rate": 0.0,
+            "avg_trade_return": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "max_drawdown": 0.0,
+            "max_drawdown_duration": 0
+        }
+
+    trade_returns = pd.Series(trade_returns)
+    gross_trade_returns = pd.Series(gross_trade_returns)
+    trade_stats = _trade_metrics(trade_returns)
+    trade_count = int(len(trade_returns))
+    trade_rate = float(trade_count / len(preds)) if len(preds) else 0.0
+    turnover = float(2.0 * trade_count / len(preds)) if len(preds) else 0.0
+    cumulative_return = float((1 + trade_returns).prod() - 1)
+    gross_cumulative_return = float((1 + gross_trade_returns).prod() - 1)
+    mean_return = float(trade_returns.mean())
+    volatility = float(trade_returns.std())
+    sharpe_like = float(mean_return / volatility) if volatility != 0 else 0.0
+    gross_mean_return = float(gross_trade_returns.mean())
+    gross_volatility = float(gross_trade_returns.std())
+    gross_sharpe_like = float(gross_mean_return / gross_volatility) if gross_volatility != 0 else 0.0
+    total_cost = float(2.0 * cost_per_side * trade_count)
+    max_drawdown, max_duration = _drawdown_stats(trade_returns)
+
+    return {
+        "eval_mode": eval_mode,
+        "transaction_cost_bps": float(transaction_cost_bps),
+        "total_cost": total_cost,
+        "samples": int(len(trade_returns)),
+        "trade_count": trade_count,
+        "trade_rate": trade_rate,
+        "turnover": turnover,
+        "cumulative_return": cumulative_return,
+        "gross_cumulative_return": gross_cumulative_return,
+        "gross_mean_return": gross_mean_return,
+        "gross_volatility": gross_volatility,
+        "gross_sharpe_like": gross_sharpe_like,
+        "cost_impact": float(gross_cumulative_return - cumulative_return),
+        "mean_return": mean_return,
+        "volatility": volatility,
+        "sharpe_like": sharpe_like,
+        "win_rate": trade_stats["win_rate"],
+        "avg_trade_return": trade_stats["avg_trade_return"],
+        "profit_factor": trade_stats["profit_factor"],
+        "expectancy": trade_stats["expectancy"],
+        "avg_win": trade_stats["avg_win"],
+        "avg_loss": trade_stats["avg_loss"],
+        "gross_profit": trade_stats["gross_profit"],
+        "gross_loss": trade_stats["gross_loss"],
+        "max_drawdown": max_drawdown,
+        "max_drawdown_duration": max_duration
+    }
+
 from modules.superma import SuperMA4hr
 from modules.trendmagic import TrendMagicV2
 from modules.pvt_eliminator import PVTEliminator
@@ -166,38 +546,111 @@ def generate_splits(
     return splits
 
 
+def _infer_bar_delta(index: pd.DatetimeIndex) -> Optional[pd.Timedelta]:
+    if len(index) < 2:
+        return None
+    diffs = index.to_series().diff().dropna()
+    if diffs.empty:
+        return None
+    return diffs.median()
+
+
+def _apply_purge_and_embargo(
+    splits: List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]],
+    df: pd.DataFrame,
+    purge_bars: int,
+    embargo_days: int,
+) -> Tuple[List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]], pd.Timedelta, pd.Timedelta]:
+    if purge_bars <= 0 and embargo_days <= 0:
+        return splits, pd.Timedelta(0), pd.Timedelta(0)
+
+    bar_delta = _infer_bar_delta(df.index)
+    purge_delta = pd.Timedelta(0)
+    if purge_bars > 0:
+        if bar_delta is None or pd.isna(bar_delta):
+            raise ValueError("Cannot infer bar duration for purge-bars; disable purge or use embargo-days.")
+        purge_delta = bar_delta * purge_bars
+
+    embargo_delta = pd.Timedelta(days=embargo_days) if embargo_days > 0 else pd.Timedelta(0)
+    adjusted = []
+    start_date = df.index[0]
+    end_date = df.index[-1]
+
+    for train_start, train_end, val_start, val_end in splits:
+        adj_train_end = train_end - purge_delta
+        adj_val_start = val_start + embargo_delta
+        adj_val_end = val_end + embargo_delta
+
+        if adj_train_end <= train_start:
+            continue
+        if adj_val_start >= adj_val_end:
+            continue
+        if adj_train_end >= adj_val_start:
+            continue
+        if adj_val_end > end_date:
+            continue
+        if adj_train_end <= start_date or adj_val_start <= start_date:
+            continue
+
+        adjusted.append((train_start, adj_train_end, adj_val_start, adj_val_end))
+
+    return adjusted, purge_delta, embargo_delta
+
+
 def train_one_window(
     df_train: pd.DataFrame,
     signal_modules: List,
     context_modules: List,
     feats_train: pd.DataFrame,
-    horizon_bars: int = 48,
-    label_threshold: float = 0.0005
-) -> Tuple[RegimeDetector, SignalBlender, Dict]:
+    horizon_bars: int = 12,
+    label_threshold: float = 0.0005,
+    regime_label_strategy: str = "indicator",
+    smoothing_window: int = 12,
+    use_gpu: bool = False,
+    random_state: Optional[int] = None,
+    calibration_method: Optional[str] = None,
+    sharpening_alpha: float = 2.0,
+    disable_calibration: bool = False,
+    X_val: Optional[pd.DataFrame] = None,
+    y_val: Optional[pd.Series] = None,
+    calibration_source: str = "train"
+) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict, Dict]:
     """
-    Train regime detector and signal blender on a training window.
+    Train regime detector, signal blender, direction blender, and regime-specific models on a training window.
     
     Args:
         df_train: Training data window
         signal_modules: List of signal modules
         context_modules: List of context modules
+        feats_train: Training features
         horizon_bars: Forward horizon in bars for direction labels
         label_threshold: Threshold for direction labels
+        regime_label_strategy: Regime label strategy ("indicator" or "rule")
+        smoothing_window: Smoothing window for direction labels
+        use_gpu: Whether to use GPU acceleration for models
+        random_state: Random seed for model initialization
+        calibration_method: Calibration method for SignalBlender
+        sharpening_alpha: Sharpening alpha for calibrated probabilities
+        disable_calibration: Disable calibration for SignalBlender
+        X_val: Optional validation features for calibration (used when calibration_source='val')
+        y_val: Optional validation labels for calibration (used when calibration_source='val')
+        calibration_source: Source of calibration data ('train' or 'val', default: 'train')
         
     Returns:
-        Tuple of (regime_detector, signal_blender, training_stats)
+        Tuple of (regime_detector, signal_blender, direction_blender, training_stats, regime_models_dict)
     """
     # Enforce index integrity between raw data and cached features to avoid
     # silent misalignment after cleaning/warmups.
     assert feats_train.index.equals(df_train.index), "Feature/price index mismatch in training window"
 
     # Generate labels
-    regime_y = rule_based_regime(feats_train, df_train)
+    regime_y = build_regime_labels(df_train, feats_train, regime_label_strategy)
     # Use new direction labels
     df_labeled = make_direction_labels(
         df_train,
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
+        smoothing_window=smoothing_window,
         debug=False  # Suppress debug output in walk-forward windows
     )
     blend_y = df_labeled['blend_label'].reindex(feats_train.index).fillna(0).astype(int)
@@ -227,11 +680,113 @@ def train_one_window(
     }).fillna(2)  # Default to chop if unknown
     
     # Train models
-    reg = RegimeDetector()
+    reg = RegimeDetector(use_gpu=use_gpu, random_state=random_state)
     reg.fit(X_regime, regime_y)
     
-    blender = SignalBlender(return_threshold=0.001)
-    blender.fit(X_blend, blend_y)
+    # Determine calibration data based on calibration_source
+    X_cal = None
+    y_cal = None
+    if calibration_source == "val" and X_val is not None and y_val is not None:
+        # Use validation window for calibration
+        X_cal = X_val
+        y_cal = y_val
+    # Otherwise, calibration will use train data (default behavior in SignalBlender.fit)
+    
+    blender = SignalBlender(use_gpu=use_gpu, random_state=random_state)
+    blender.fit(
+        X_blend,
+        blend_y,
+        calibration_method=calibration_method,
+        sharpening_alpha=sharpening_alpha,
+        X_val=X_cal,
+        y_val=y_cal,
+        disable_calibration=disable_calibration
+    )
+    
+    # Train DirectionBlender on trade samples only
+    mask_trade = blend_y != 0
+    X_blend_trade = X_blend[mask_trade]
+    blend_y_trade = blend_y[mask_trade]
+    
+    direction_blender = None
+    if len(X_blend_trade) >= 1000:  # Minimum samples threshold
+        y_direction = pd.Series(
+            np.where(blend_y_trade > 0, 1, -1),
+            index=blend_y_trade.index,
+            dtype=int,
+            name='direction'
+        )
+        
+        # Determine calibration data for DirectionBlender
+        X_cal_dir = None
+        y_cal_dir = None
+        if calibration_source == "val" and X_val is not None and y_val is not None:
+            # Filter validation to trade samples
+            y_val_trade = y_val[y_val != 0]
+            if len(y_val_trade) >= 200:  # Minimum validation samples
+                X_cal_dir = X_val.loc[y_val_trade.index]
+                y_cal_dir = pd.Series(
+                    np.where(y_val_trade > 0, 1, -1),
+                    index=y_val_trade.index,
+                    dtype=int,
+                    name='direction'
+                )
+        
+        direction_blender = DirectionBlender(use_gpu=use_gpu, random_state=random_state)
+        direction_blender.fit(
+            X_blend_trade,
+            y_direction,
+            calibration_method=calibration_method,
+            sharpening_alpha=sharpening_alpha,
+            X_val=X_cal_dir,
+            y_val=y_cal_dir,
+            disable_calibration=disable_calibration
+        )
+    
+    # Train regime-specific models
+    regime_models = {}
+    regime_classes = sorted(pd.unique(regime_y))
+    
+    for regime_name in regime_classes:
+        mask_regime = (regime_y == regime_name)
+        X_blend_regime = X_blend[mask_regime]
+        blend_y_regime = blend_y[mask_regime]
+        
+        if len(X_blend_regime) < 5000:  # Skip if insufficient samples
+            continue
+        
+        # Determine calibration data for regime-specific model
+        X_cal_regime = None
+        y_cal_regime = None
+        if calibration_source == "val" and X_val is not None and y_val is not None:
+            # Filter validation to this regime
+            regime_pred_val = reg.predict(X_val.loc[y_val.index] if hasattr(X_val, 'loc') else X_val)
+            mask_val_regime = (regime_pred_val == regime_name)
+            if mask_val_regime.sum() >= 1000:  # Minimum validation samples
+                X_cal_regime = X_val[mask_val_regime]
+                y_cal_regime = y_val[mask_val_regime]
+        
+        model_params = {
+            'n_estimators': 300,
+            'max_depth': 10,
+            'n_bins': 128,
+            'split_criterion': 0,
+            'bootstrap': True,
+            'max_samples': 0.8,
+            'max_features': 0.9,
+            'n_streams': 4
+        }
+        model_r = SignalBlender(model_params=model_params, use_gpu=use_gpu, random_state=random_state)
+        model_r.fit(
+            X_blend_regime,
+            blend_y_regime,
+            calibration_method=calibration_method,
+            sharpening_alpha=sharpening_alpha,
+            X_val=X_cal_regime,
+            y_val=y_cal_regime,
+            disable_calibration=disable_calibration
+        )
+        regime_models[regime_name] = model_r
     
     # Training statistics
     stats = {
@@ -241,7 +796,7 @@ def train_one_window(
         'feature_count': len(feats_train.columns)
     }
     
-    return reg, blender, stats
+    return reg, blender, direction_blender, stats, regime_models
 
 
 def validate_one_window(
@@ -251,8 +806,12 @@ def validate_one_window(
     signal_modules: List,
     context_modules: List,
     feats_val: pd.DataFrame,
-    horizon_bars: int = 48,
-    label_threshold: float = 0.0005
+    horizon_bars: int = 12,
+    label_threshold: float = 0.0005,
+    regime_label_strategy: str = "indicator",
+    smoothing_window: int = 12,
+    eval_mode: str = "nonoverlap",
+    transaction_cost_bps: float = 0.0
 ) -> Dict:
     """
     Validate models on a validation window.
@@ -265,6 +824,10 @@ def validate_one_window(
         context_modules: List of context modules
         horizon_bars: Forward horizon in bars for direction labels
         label_threshold: Threshold for direction labels
+        regime_label_strategy: Regime label strategy ("indicator" or "rule")
+        smoothing_window: Smoothing window for direction labels
+        eval_mode: Return evaluation mode ("nonoverlap" or "per-bar")
+        transaction_cost_bps: Cost per side in basis points
         
     Returns:
         Dictionary with validation metrics
@@ -274,11 +837,12 @@ def validate_one_window(
     assert feats_val.index.equals(df_val.index), "Feature/price index mismatch in validation window"
 
     # Generate true labels (use new direction labels for consistency)
-    regime_y_true = rule_based_regime(feats_val, df_val)
+    regime_y_true = build_regime_labels(df_val, feats_val, regime_label_strategy)
     df_labeled = make_direction_labels(
         df_val,
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
+        smoothing_window=smoothing_window,
         debug=False  # Suppress debug output in walk-forward windows
     )
     blend_y_true = df_labeled['blend_label'].reindex(feats_val.index).fillna(0).astype(int)
@@ -326,16 +890,23 @@ def validate_one_window(
     regime_accuracy = (regime_y_pred == regime_y_true).mean()
     blend_accuracy = (blend_y_pred == blend_y_true).mean()
     
-    # Calculate returns for signal accuracy
-    actual_returns = future_return(df_val['close'], horizon=horizon_bars).reindex(blend_y_true.index)
-    signal_returns = blend_y_pred * actual_returns
-    cumulative_return = (1 + signal_returns).prod() - 1
-    
+    return_metrics = compute_return_metrics(
+        blend_y_pred,
+        df_val['close'].reindex(blend_y_pred.index),
+        horizon_bars=horizon_bars,
+        eval_mode=eval_mode,
+        transaction_cost_bps=transaction_cost_bps
+    )
+
     metrics = {
         'val_samples': len(X_regime),
         'regime_accuracy': float(regime_accuracy),
         'blend_accuracy': float(blend_accuracy),
-        'cumulative_return': float(cumulative_return),
+        'cumulative_return': float(return_metrics['cumulative_return']),
+        'gross_cumulative_return': float(return_metrics['gross_cumulative_return']),
+        'max_drawdown': float(return_metrics['max_drawdown']),
+        'max_drawdown_duration': int(return_metrics['max_drawdown_duration']),
+        'return_metrics': return_metrics,
         'regime_dist_true': regime_y_true.value_counts().to_dict(),
         'regime_dist_pred': regime_y_pred.value_counts().to_dict(),
         'blend_dist_true': blend_y_true.value_counts().to_dict(),
@@ -352,6 +923,15 @@ def build_features_once(
     cache_path: Path,
     force_recompute: bool = False,
     use_gpu: bool = False,
+    # Ablation flags
+    disable_ml_features: bool = False,
+    disable_regime_context: bool = False,
+    disable_signal_dynamics: bool = False,
+    disable_rolling_stats: bool = False,
+    disable_modules: List[str] = None,
+    include_modules: Optional[List[str]] = None,
+    include_features: Optional[List[str]] = None,
+    exclude_features: Optional[List[str]] = None,
 ) -> Tuple[FeatureStore, pd.DataFrame]:
     """
     Compute all features exactly once, cache to Parquet, and reuse for slicing.
@@ -359,8 +939,21 @@ def build_features_once(
     This centralizes the expensive feature computation step and ensures the
     walk-forward loop only slices cached features instead of rebuilding per
     window.
+    
+    Ablation flags allow disabling specific feature groups for A/B testing.
+    Feature filters allow include/exclude regex after feature generation.
     """
-    feature_store = FeatureStore(use_gpu=use_gpu)
+    feature_store = FeatureStore(
+        use_gpu=use_gpu,
+        disable_ml_features=disable_ml_features,
+        disable_regime_context=disable_regime_context,
+        disable_signal_dynamics=disable_signal_dynamics,
+        disable_rolling_stats=disable_rolling_stats,
+        disable_modules=disable_modules,
+        include_modules=include_modules,
+        include_features=include_features,
+        exclude_features=exclude_features,
+    )
     cached_features = feature_store.build_and_cache(
         df,
         signal_modules,
@@ -398,9 +991,24 @@ def prepare_windows(
     train_months: int,
     val_months: int,
     slide_months: int,
+    embargo_days: int = 0,
+    purge_bars: int = 0,
 ) -> List[Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]]:
     """Lightweight wrapper to document walk-forward split generation."""
-    return generate_splits(df, train_months, val_months, slide_months)
+    splits = generate_splits(df, train_months, val_months, slide_months)
+    adjusted, purge_delta, embargo_delta = _apply_purge_and_embargo(
+        splits,
+        df,
+        purge_bars=purge_bars,
+        embargo_days=embargo_days,
+    )
+    if purge_bars > 0 or embargo_days > 0:
+        print(f"[WalkForward] Purge bars: {purge_bars} ({purge_delta})")
+        print(f"[WalkForward] Embargo days: {embargo_days} ({embargo_delta})")
+        dropped = len(splits) - len(adjusted)
+        if dropped > 0:
+            print(f"[WalkForward] Dropped {dropped} splits due to purge/embargo constraints")
+    return adjusted
 
 
 def train_models_for_window(
@@ -410,7 +1018,17 @@ def train_models_for_window(
     context_modules: List,
     horizon_bars: int,
     label_threshold: float,
-) -> Tuple[RegimeDetector, SignalBlender, Dict]:
+    regime_label_strategy: str,
+    smoothing_window: int,
+    use_gpu: bool,
+    random_state: Optional[int],
+    calibration_method: Optional[str],
+    sharpening_alpha: float,
+    disable_calibration: bool,
+    X_val: Optional[pd.DataFrame] = None,
+    y_val: Optional[pd.Series] = None,
+    calibration_source: str = "train",
+) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict, Dict]:
     """Thin wrapper to make the training stage signature explicit."""
     return train_one_window(
         df_window,
@@ -419,6 +1037,16 @@ def train_models_for_window(
         feats_window,
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
+        regime_label_strategy=regime_label_strategy,
+        smoothing_window=smoothing_window,
+        use_gpu=use_gpu,
+        random_state=random_state,
+        calibration_method=calibration_method,
+        sharpening_alpha=sharpening_alpha,
+        disable_calibration=disable_calibration,
+        X_val=X_val,
+        y_val=y_val,
+        calibration_source=calibration_source,
     )
 
 
@@ -431,6 +1059,10 @@ def validate_models_for_window(
     context_modules: List,
     horizon_bars: int,
     label_threshold: float,
+    regime_label_strategy: str,
+    smoothing_window: int,
+    eval_mode: str,
+    transaction_cost_bps: float,
 ) -> Dict:
     """Thin wrapper to make the validation stage signature explicit."""
     return validate_one_window(
@@ -442,6 +1074,10 @@ def validate_models_for_window(
         feats_window,
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
+        regime_label_strategy=regime_label_strategy,
+        smoothing_window=smoothing_window,
+        eval_mode=eval_mode,
+        transaction_cost_bps=transaction_cost_bps,
     )
 
 
@@ -456,9 +1092,30 @@ def combined_training(
     train_months: int = 6,
     val_months: int = 1,
     slide_months: int = 1,
-    horizon_bars: int = 48,
-    label_threshold: float = 0.0005
-) -> Tuple[RegimeDetector, SignalBlender]:
+    embargo_days: int = 0,
+    purge_bars: int = 0,
+    horizon_bars: int = 12,
+    label_threshold: float = 0.0005,
+    regime_label_strategy: str = "indicator",
+    smoothing_window: int = 12,
+    use_gpu: bool = False,
+    random_state: Optional[int] = None,
+    calibration_method: Optional[str] = None,
+    sharpening_alpha: float = 2.0,
+    disable_calibration: bool = False,
+    calibration_source: str = "train",
+    eval_mode: str = "nonoverlap",
+    transaction_cost_bps: float = 0.0,
+    # Ablation flags
+    disable_ml_features: bool = False,
+    disable_regime_context: bool = False,
+    disable_signal_dynamics: bool = False,
+    disable_rolling_stats: bool = False,
+    disable_modules: Optional[List[str]] = None,
+    include_modules: Optional[List[str]] = None,
+    include_features: Optional[List[str]] = None,
+    exclude_features: Optional[List[str]] = None,
+) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict]:
     """
     Perform walk-forward training across all windows.
     
@@ -468,14 +1125,31 @@ def combined_training(
         signal_modules: List of signal modules
         context_modules: List of context modules
         models_dir: Directory to save models
+        feature_cache_path: Optional path to feature cache
+        force_recompute_cache: Whether to force recompute features
         train_months: Training window size in months
         val_months: Validation window size in months
         slide_months: Slide forward by this many months
+        embargo_days: Gap between train end and validation start in days
+        purge_bars: Bars to purge from end of training window (label leakage guard)
         horizon_bars: Forward horizon in bars for direction labels
         label_threshold: Threshold for direction labels
+        regime_label_strategy: Regime label strategy ("indicator" or "rule")
+        smoothing_window: Smoothing window for direction labels
+        use_gpu: Whether to use GPU acceleration for models
+        random_state: Random seed for model initialization
+        calibration_method: Calibration method for SignalBlender
+        sharpening_alpha: Sharpening alpha for calibrated probabilities
+        disable_calibration: Disable calibration for SignalBlender
+        calibration_source: Source of calibration data ('train' or 'val', default: 'train')
+        eval_mode: Return evaluation mode ("nonoverlap" or "per-bar")
+        transaction_cost_bps: Cost per side in basis points
+        include_modules: Optional list of module names to keep
+        include_features: Optional list of regex patterns to include
+        exclude_features: Optional list of regex patterns to exclude
         
     Returns:
-        Tuple of (final_regime_detector, final_signal_blender)
+        Tuple of (final_regime_detector, final_signal_blender, final_direction_blender, final_regime_models_dict)
     """
     # Force a single feature build to avoid O(N x windows) recomputation costs.
     cache_path = feature_cache_path or (models_dir / "cached_features.parquet")
@@ -486,10 +1160,25 @@ def combined_training(
         cache_path,
         force_recompute=force_recompute_cache,
         use_gpu=False,
+        disable_ml_features=disable_ml_features,
+        disable_regime_context=disable_regime_context,
+        disable_signal_dynamics=disable_signal_dynamics,
+        disable_rolling_stats=disable_rolling_stats,
+        disable_modules=disable_modules,
+        include_modules=include_modules,
+        include_features=include_features,
+        exclude_features=exclude_features,
     )
 
     # Generate splits
-    splits = prepare_windows(df, train_months, val_months, slide_months)
+    splits = prepare_windows(
+        df,
+        train_months,
+        val_months,
+        slide_months,
+        embargo_days=embargo_days,
+        purge_bars=purge_bars,
+    )
     
     if len(splits) == 0:
         raise ValueError("No valid splits generated. Check data range and window sizes.")
@@ -502,6 +1191,8 @@ def combined_training(
     best_val_return = -np.inf
     best_reg = None
     best_blender = None
+    best_direction_blender = None
+    best_regime_models = {}
     
     # Walk-forward training
     for i, (train_start, train_end, val_start, val_end) in enumerate(splits, 1):
@@ -526,18 +1217,68 @@ def combined_training(
         # Train on window using cached features to prevent repeated computation
         print("Training models...")
         try:
-            reg, blender, train_stats = train_models_for_window(
+            # Prepare validation data for calibration if needed
+            X_val_window = None
+            y_val_window = None
+            if calibration_source == "val":
+                # Build validation features and labels for calibration
+                regime_y_val = build_regime_labels(df_val, feats_val, regime_label_strategy)
+                df_labeled_val = make_direction_labels(
+                    df_val,
+                    horizon_bars=horizon_bars,
+                    label_threshold=label_threshold,
+                    smoothing_window=smoothing_window,
+                    debug=False
+                )
+                blend_y_val = df_labeled_val['blend_label'].reindex(feats_val.index).fillna(0).astype(int)
+                
+                valid_mask_val = ~(regime_y_val.isna() | blend_y_val.isna())
+                valid_mask_val = valid_mask_val & (regime_y_val.isin(['trend_up', 'trend_down', 'chop']))
+                
+                X_blend_base_val = feats_val[valid_mask_val]
+                blend_y_val_clean = blend_y_val[valid_mask_val]
+                
+                # Compute module signals for validation
+                module_signals_val = {}
+                for module in signal_modules:
+                    module_features_val = X_blend_base_val.filter(regex=f'^{module.name}_', axis=1).copy()
+                    if not module_features_val.empty:
+                        module_features_val.columns = [col.replace(f'{module.name}_', '') for col in module_features_val.columns]
+                    module_signals_val[module.name] = module.compute_signal(module_features_val)
+                
+                X_blend_val = X_blend_base_val.copy()
+                for module_name, signal in module_signals_val.items():
+                    X_blend_val[f"{module_name}_signal"] = signal[valid_mask_val]
+                X_blend_val["regime"] = regime_y_val[valid_mask_val].map({
+                    'trend_up': 0, 'trend_down': 1, 'chop': 2
+                }).fillna(2)
+                
+                X_val_window = X_blend_val
+                y_val_window = blend_y_val_clean
+            
+            reg, blender, direction_blender, train_stats, regime_models = train_models_for_window(
                 df_train,
                 feats_train,
                 signal_modules,
                 context_modules,
                 horizon_bars,
                 label_threshold,
+                regime_label_strategy,
+                smoothing_window,
+                use_gpu,
+                random_state,
+                calibration_method,
+                sharpening_alpha,
+                disable_calibration,
+                X_val=X_val_window,
+                y_val=y_val_window,
+                calibration_source=calibration_source,
             )
             print(f"  Training samples: {train_stats['train_samples']}")
             print(f"  Features: {train_stats['feature_count']}")
         except Exception as e:
             print(f"  Error during training: {e}")
+            print(f"  Full traceback:\n{traceback.format_exc()}")
             continue
 
         # Validate on window
@@ -552,20 +1293,28 @@ def combined_training(
                 context_modules,
                 horizon_bars,
                 label_threshold,
+                regime_label_strategy,
+                smoothing_window,
+                eval_mode,
+                transaction_cost_bps,
             )
             print(f"  Validation samples: {val_metrics['val_samples']}")
             print(f"  Regime accuracy: {val_metrics['regime_accuracy']:.4f}")
             print(f"  Blend accuracy: {val_metrics['blend_accuracy']:.4f}")
-            print(f"  Cumulative return: {val_metrics['cumulative_return']:.4f}")
+            print(f"  Net cumulative return: {val_metrics['cumulative_return']:.4f}")
+            print(f"  Gross cumulative return: {val_metrics['gross_cumulative_return']:.4f}")
 
             # Track best model
             if val_metrics['cumulative_return'] > best_val_return:
                 best_val_return = val_metrics['cumulative_return']
                 best_reg = reg
                 best_blender = blender
+                best_direction_blender = direction_blender
+                best_regime_models = regime_models
                 print(f"  *** New best model (return: {best_val_return:.4f}) ***")
         except Exception as e:
             print(f"  Error during validation: {e}")
+            print(f"  Full traceback:\n{traceback.format_exc()}")
             continue
         
         # Store results
@@ -589,11 +1338,21 @@ def combined_training(
         avg_regime_acc = np.mean([r['regime_accuracy'] for r in all_results])
         avg_blend_acc = np.mean([r['blend_accuracy'] for r in all_results])
         avg_return = np.mean([r['cumulative_return'] for r in all_results])
+        returns = np.array([r['cumulative_return'] for r in all_results], dtype=float)
+        median_return = float(np.median(returns))
+        p5 = float(np.percentile(returns, 5))
+        p95 = float(np.percentile(returns, 95))
+        trimmed_returns = returns[(returns >= p5) & (returns <= p95)]
+        trimmed_mean = float(trimmed_returns.mean()) if trimmed_returns.size else float(avg_return)
+        positive_pct = float((returns > 0).mean())
         
         print(f"Windows processed: {len(all_results)}")
         print(f"Average regime accuracy: {avg_regime_acc:.4f}")
         print(f"Average blend accuracy: {avg_blend_acc:.4f}")
         print(f"Average cumulative return: {avg_return:.4f}")
+        print(f"Median cumulative return: {median_return:.4f}")
+        print(f"Trimmed mean return (5-95%): {trimmed_mean:.4f}")
+        print(f"Positive-return windows: {positive_pct:.2%}")
         print(f"Best validation return: {best_val_return:.4f}")
         
         # Save results log
@@ -612,24 +1371,33 @@ def combined_training(
             # Retrain on last window
             last_split = splits[-1]
             df_train, feats_last = slice_window(df, cached_features, last_split[0], last_split[1])
-            best_reg, best_blender, _ = train_models_for_window(
+            best_reg, best_blender, best_direction_blender, _, best_regime_models = train_models_for_window(
                 df_train,
                 feats_last,
                 signal_modules,
                 context_modules,
                 horizon_bars,
                 label_threshold,
+                regime_label_strategy,
+                smoothing_window,
+                use_gpu,
+                random_state,
+                calibration_method,
+                sharpening_alpha,
+                disable_calibration,
+                calibration_source=calibration_source,
             )
         else:
             raise ValueError("Cannot create final models - no successful training")
     
-    return best_reg, best_blender
+    return best_reg, best_blender, best_direction_blender, best_regime_models
 
 
 def downsample_validation_for_calibration(
     X_val: pd.DataFrame,
     y_val: pd.Series,
-    target_size: int = 50000
+    target_size: int = 50000,
+    random_state: int = 42
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """
     Downsample validation set for calibration to avoid GPU OOM.
@@ -639,6 +1407,7 @@ def downsample_validation_for_calibration(
         X_val: Validation features
         y_val: Validation labels
         target_size: Target number of samples (default: 50000)
+        random_state: Random seed for sampling
         
     Returns:
         Tuple of (X_val_cal, y_val_cal) - downsampled validation set
@@ -652,7 +1421,7 @@ def downsample_validation_for_calibration(
     X_val_cal, _, y_val_cal, _ = train_test_split(
         X_val, y_val,
         train_size=target_size,
-        random_state=42,
+        random_state=random_state,
         stratify=y_val
     )
     
@@ -672,6 +1441,7 @@ def train_full_pipeline(
     models_dir: Path = Path("models"),
     results_dir: Path = Path("results"),
     use_gpu: bool = False,
+    random_state: int = 42,
 ) -> Tuple:
     """
     Full training pipeline with feature pruning, importance analysis, and diagnostics.
@@ -688,6 +1458,7 @@ def train_full_pipeline(
         prune_bottom_percentile: Bottom percentile to prune (e.g., 20.0 = bottom 20%)
         models_dir: Directory to save models
         results_dir: Directory to save results
+        random_state: Random seed for internal splits
         
     Returns:
         Tuple of (trained_model, diagnostics_dict)
@@ -702,7 +1473,7 @@ def train_full_pipeline(
     if X_val is None or y_val is None:
         print(f"\n[1/7] Auto-splitting 20% for validation (stratified)...")
         X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
-            X_train, y_train, test_size=0.2, random_state=42, stratify=y_train
+            X_train, y_train, test_size=0.2, random_state=random_state, stratify=y_train
         )
         X_train = X_train_split
         X_val = X_val_split
@@ -718,12 +1489,17 @@ def train_full_pipeline(
     n_features_before = len(X_train.columns)
     
     # 1.5. Downsample validation set for calibration (to avoid GPU OOM)
-    X_val_cal, y_val_cal = downsample_validation_for_calibration(X_val, y_val, target_size=50000)
+    X_val_cal, y_val_cal = downsample_validation_for_calibration(
+        X_val,
+        y_val,
+        target_size=50000,
+        random_state=random_state
+    )
     print(f"[{model_name}] Using {len(X_val_cal)} samples for calibration (downsampled from {len(X_val)}).")
     
     # 2. Initial training
     print(f"\n[2/7] Initial training...")
-    model = model_class(use_gpu=use_gpu)
+    model = model_class(use_gpu=use_gpu, random_state=random_state)
     model.fit(
         X_train, y_train,
         calibration_method=calibration_method,
@@ -787,11 +1563,14 @@ def train_full_pipeline(
         
         # Downsample validation for calibration (pruned features)
         X_val_pruned_cal, y_val_pruned_cal = downsample_validation_for_calibration(
-            X_val_pruned, y_val, target_size=50000
+            X_val_pruned,
+            y_val,
+            target_size=50000,
+            random_state=random_state
         )
         print(f"[{model_name}] Using {len(X_val_pruned_cal)} samples for calibration (downsampled from {len(X_val_pruned)}).")
         
-        model_pruned = model_class(use_gpu=use_gpu)
+        model_pruned = model_class(use_gpu=use_gpu, random_state=random_state)
         model_pruned.fit(
             X_train_pruned, y_train,
             calibration_method=calibration_method,
@@ -904,14 +1683,63 @@ def main():
                         help='Disable probability calibration entirely')
     parser.add_argument('--use-full-pipeline', action='store_true',
                         help='Use full training pipeline with feature pruning and diagnostics')
-    parser.add_argument('--horizon-bars', type=int, default=48,
-                        help='Forward horizon in bars for label generation (default: 48 = 4 hours for 5-min data)')
+    parser.add_argument('--horizon-bars', type=int, default=12,
+                        help='Forward horizon in bars for label generation (default: 12 = 1 hour for 5-min data)')
     parser.add_argument('--label-threshold', type=float, default=0.0005,
                         help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
+    parser.add_argument('--min-trade-proba', type=float, default=0.0,
+                        help='Minimum SignalBlender max proba to take a trade; below -> flat (default: 0.0)')
+    parser.add_argument('--fee-bps', type=float, default=1.0,
+                        help='Transaction cost per side in bps; use 0 to disable (default: 1.0)')
+    parser.add_argument('--eval-mode', type=str, default='nonoverlap', choices=['nonoverlap', 'per-bar'],
+                        help='Return evaluation mode: nonoverlap or per-bar (default: nonoverlap)')
+    
+    # Feature ablation flags (for A/B testing feature groups)
+    parser.add_argument('--disable-ml-features', action='store_true',
+                        help='Disable ML features (returns, volatility, RSI, SMA distances, candle metrics)')
+    parser.add_argument('--disable-regime-context', action='store_true',
+                        help='Disable regime context features (ATR ratios, volatility ratios, trend slopes)')
+    parser.add_argument('--disable-signal-dynamics', action='store_true',
+                        help='Disable signal dynamics features (streaks, time-since-signal, derivatives)')
+    parser.add_argument('--disable-rolling-stats', action='store_true',
+                        help='Disable rolling statistics (rolling mean/std/max/min/zscore)')
+    parser.add_argument('--disable-modules', type=str, default=None,
+                        help='Comma-separated list of modules to disable (e.g., "superma,trendmagic,pvt")')
+    parser.add_argument('--include-modules', type=str, default=None,
+                        help='Comma-separated list of modules to keep (others disabled)')
+    parser.add_argument('--include-features', type=str, default=None,
+                        help='Comma-separated regex patterns of features to keep (applied after generation)')
+    parser.add_argument('--exclude-features', type=str, default=None,
+                        help='Comma-separated regex patterns of features to drop (applied after generation)')
+    
     parser.add_argument('--runpod', action='store_true',
                         help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     parser.add_argument('--cpu-only', action='store_true',
                         help='Force CPU even if cuML is installed')
+    parser.add_argument('--walkforward', action='store_true',
+                        help='Use walk-forward training instead of the single 80/20 split')
+    parser.add_argument('--train-months', type=int, default=6,
+                        help='Walk-forward training window size in months (default: 6)')
+    parser.add_argument('--val-months', type=int, default=1,
+                        help='Walk-forward validation window size in months (default: 1)')
+    parser.add_argument('--slide-months', type=int, default=1,
+                        help='Walk-forward slide step in months (default: 1)')
+    parser.add_argument('--embargo-days', type=int, default=0,
+                        help='Embargo gap in days between training end and validation start (default: 0)')
+    parser.add_argument('--purge-bars', type=int, default=0,
+                        help='Bars to purge from end of training window to reduce label leakage (default: 0)')
+    parser.add_argument('--purge-horizon', action='store_true',
+                        help='Purge horizon_bars from end of training window (overrides --purge-bars)')
+    parser.add_argument('--smoothing-window', type=int, default=12,
+                        help='Smoothing window for direction labels (default: 12)')
+    parser.add_argument('--regime-labels', type=str, default='indicator', choices=['indicator', 'rule'],
+                        help='Regime label strategy: indicator (make_regime_labels) or rule (rule_based_regime)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility (default: 42)')
+    parser.add_argument('--calibration-source', type=str, default='train', choices=['train', 'val'],
+                        help='Calibration data source for walk-forward: train (use training window) or val (use validation window) (default: train)')
+    parser.add_argument('--log-file', type=str, default=None,
+                        help='Path to log file (default: results/train.log)')
     args = parser.parse_args()
 
     # Configuration
@@ -923,6 +1751,23 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = Path(args.log_file) if args.log_file else (results_dir / "train.log")
+    log_file, _, _ = _setup_logging(log_path)
+    print(f"[Logging] Writing output to {log_path}")
+
+    # Enable faulthandler for crash debugging (dumps traceback on SIGSEGV, SIGFPE, etc.)
+    try:
+        faulthandler.enable(file=log_file)
+        print("[Debug] faulthandler enabled for crash diagnostics")
+    except Exception as exc:
+        faulthandler.enable(file=sys.__stderr__)
+        print(f"[Debug] faulthandler fallback to sys.__stderr__: {exc}")
+
+    set_global_seed(args.seed)
+    print(f"[Seed] Using random seed: {args.seed}")
+    regime_label_strategy = args.regime_labels
+    print(f"[Labels] Regime label strategy: {regime_label_strategy}")
     
     # GPU detection: check for cuML availability
     try:
@@ -951,39 +1796,108 @@ def main():
     print(f"\nCalibration settings:")
     print(f"  Method: {calibration_method if calibration_method else 'DISABLED'}")
     print(f"  Sharpening alpha: {sharpening_alpha}")
+    print(f"[Evaluation] Mode: {args.eval_mode}, Fee bps: {args.fee_bps:.2f}")
+
+    purge_bars = args.horizon_bars if args.purge_horizon else args.purge_bars
     
     # New label system configuration
-    HORIZON_BARS = args.horizon_bars  # Forward horizon in bars (default: 48)
+    HORIZON_BARS = args.horizon_bars  # Forward horizon in bars (default: 12 = 1 hour for 5-min data)
     LABEL_THRESHOLD = args.label_threshold  # Threshold for direction labels (default: 0.0005)
-    SMOOTHING_WINDOW = 12  # Rolling window for smoothing returns
+    SMOOTHING_WINDOW = args.smoothing_window  # Rolling window for smoothing returns
     
     # 1. Load BTC data with load_btc_csv
     print("Loading BTC CSV data...")
-    # Prefer 4H data for faster experimentation, then fall back to 1m
-    csv_paths = [
-        data_dir / 'btcusd_4H.csv',           # 4-hour data (small, fast)
-        data_dir / 'btcusd_1min.csv',         # 1-minute data (large)
-        data_dir / 'btc_1m.csv',
-        data_dir / 'btcusd_1min_volspikes.csv',
-        data_dir / 'btc_data.csv',
-    ]
-    df = None
-    for path in csv_paths:
-        try:
-            df = load_btc_csv(str(path))
-            print(f"Loaded from: {path}")
-            break
-        except FileNotFoundError:
-            continue
     
-    if df is None:
-        # Try to find any CSV in data directory
-        csv_files = list(data_dir.glob("*.csv"))
-        if csv_files:
-            df = load_btc_csv(str(csv_files[0]))
-            print(f"Loaded from: {csv_files[0]}")
+    # For walk-forward training, use split datasets (train/val/test)
+    if args.walkforward:
+        train_path = data_dir / 'btcusd_5min_train_2017_2022.csv'
+        val_path = data_dir / 'btcusd_5min_val_2023.csv'
+        test_path = data_dir / 'btcusd_5min_test_2024.csv'
+        
+        if train_path.exists() and val_path.exists():
+            print(f"Loading split datasets for walk-forward training...")
+            df_train_split = load_btc_csv(str(train_path))
+            df_val_split = load_btc_csv(str(val_path))
+            # Combine train and val for walk-forward (test is separate)
+            df = pd.concat([df_train_split, df_val_split]).sort_index()
+            data_path = f"{train_path.name} + {val_path.name}"
+            print(f"Loaded train: {len(df_train_split)} bars from {train_path}")
+            print(f"Loaded val: {len(df_val_split)} bars from {val_path}")
+            if test_path.exists():
+                print(f"Note: Test set available at {test_path.name} (not used in walk-forward)")
         else:
-            raise FileNotFoundError("No CSV files found in data/ directory")
+            print(f"Warning: Split datasets not found, falling back to single file...")
+            # Fall back to single file
+            csv_paths = [
+                data_dir / 'btcusd_5min.csv',
+                data_dir / 'btcusd_4H.csv',
+                data_dir / 'btcusd_1min.csv',
+                data_dir / 'btc_1m.csv',
+                data_dir / 'btcusd_1min_volspikes.csv',
+                data_dir / 'btc_data.csv',
+            ]
+            df = None
+            data_path = None
+            for path in csv_paths:
+                try:
+                    df = load_btc_csv(str(path))
+                    data_path = path
+                    print(f"Loaded from: {path}")
+                    break
+                except FileNotFoundError:
+                    continue
+            
+            if df is None:
+                csv_files = list(data_dir.glob("*.csv"))
+                if csv_files:
+                    df = load_btc_csv(str(csv_files[0]))
+                    data_path = csv_files[0]
+                    print(f"Loaded from: {csv_files[0]}")
+                else:
+                    raise FileNotFoundError("No CSV files found in data/ directory")
+    else:
+        # For static training, prefer split datasets but combine train+val
+        train_path = data_dir / 'btcusd_5min_train_2017_2022.csv'
+        val_path = data_dir / 'btcusd_5min_val_2023.csv'
+        
+        if train_path.exists() and val_path.exists():
+            print(f"Loading split datasets for static training...")
+            df_train_split = load_btc_csv(str(train_path))
+            df_val_split = load_btc_csv(str(val_path))
+            # Combine train and val for static training
+            df = pd.concat([df_train_split, df_val_split]).sort_index()
+            data_path = f"{train_path.name} + {val_path.name}"
+            print(f"Loaded train: {len(df_train_split)} bars from {train_path}")
+            print(f"Loaded val: {len(df_val_split)} bars from {val_path}")
+        else:
+            # Fall back to single file
+            csv_paths = [
+                data_dir / 'btcusd_5min.csv',
+                data_dir / 'btcusd_4H.csv',
+                data_dir / 'btcusd_1min.csv',
+                data_dir / 'btc_1m.csv',
+                data_dir / 'btcusd_1min_volspikes.csv',
+                data_dir / 'btc_data.csv',
+            ]
+            df = None
+            data_path = None
+            for path in csv_paths:
+                try:
+                    df = load_btc_csv(str(path))
+                    data_path = path
+                    print(f"Loaded from: {path}")
+                    break
+                except FileNotFoundError:
+                    continue
+            
+            if df is None:
+                csv_files = list(data_dir.glob("*.csv"))
+                if csv_files:
+                    df = load_btc_csv(str(csv_files[0]))
+                    data_path = csv_files[0]
+                    print(f"Loaded from: {csv_files[0]}")
+                else:
+                    raise FileNotFoundError("No CSV files found in data/ directory")
     
     if df.empty:
         print("Error: No data loaded.")
@@ -991,20 +1905,199 @@ def main():
     
     print(f"Loaded {len(df)} bars from {df.index[0]} to {df.index[-1]}")
     
+    # Parse ablation flags
+    disable_modules_list = None
+    if args.disable_modules:
+        disable_modules_list = [m.strip() for m in args.disable_modules.split(',') if m.strip()]
+
+    include_modules_list = None
+    if args.include_modules:
+        include_modules_list = [m.strip() for m in args.include_modules.split(',') if m.strip()]
+
+    include_features_list = None
+    if args.include_features:
+        include_features_list = [f.strip() for f in args.include_features.split(',') if f.strip()]
+
+    exclude_features_list = None
+    if args.exclude_features:
+        exclude_features_list = [f.strip() for f in args.exclude_features.split(',') if f.strip()]
+    
+    # Log ablation settings
+    ablation_settings = {
+        'disable_ml_features': args.disable_ml_features,
+        'disable_regime_context': args.disable_regime_context,
+        'disable_signal_dynamics': args.disable_signal_dynamics,
+        'disable_rolling_stats': args.disable_rolling_stats,
+        'disable_modules': disable_modules_list,
+        'include_modules': include_modules_list,
+        'include_features': include_features_list,
+        'exclude_features': exclude_features_list,
+    }
+    if any(v for v in ablation_settings.values() if v):
+        print(f"\n[ABLATION] Feature ablation enabled:")
+        for k, v in ablation_settings.items():
+            if v:
+                print(f"  {k}: {v}")
+    
     # 2. Build or load cached features once to avoid recomputation across runs
     cache_path = models_dir / "cached_features.parquet"
-    feature_store = FeatureStore()
+    feature_store = FeatureStore(
+        disable_ml_features=args.disable_ml_features,
+        disable_regime_context=args.disable_regime_context,
+        disable_signal_dynamics=args.disable_signal_dynamics,
+        disable_rolling_stats=args.disable_rolling_stats,
+        disable_modules=disable_modules_list,
+        include_modules=include_modules_list,
+        include_features=include_features_list,
+        exclude_features=exclude_features_list,
+    )
     feature_store, feats = build_features_once(
         df,
         signal_modules=feature_store.signal_modules,
         context_modules=feature_store.context_modules,
         cache_path=cache_path,
         use_gpu=False,
+        disable_ml_features=args.disable_ml_features,
+        disable_regime_context=args.disable_regime_context,
+        disable_signal_dynamics=args.disable_signal_dynamics,
+        disable_rolling_stats=args.disable_rolling_stats,
+        disable_modules=disable_modules_list,
+        include_modules=include_modules_list,
+        include_features=include_features_list,
+        exclude_features=exclude_features_list,
     )
     print(f"[Features] Loaded cached features: {feats.shape}")
     
     # Print final feature columns for verification
     print("\nFINAL FEATURE COLUMNS:", feats.columns.tolist())
+
+    if args.walkforward:
+        print("\n" + "=" * 60)
+        print("WALK-FORWARD TRAINING")
+        print("=" * 60)
+        print(f"[Calibration] Using {args.calibration_source} data for calibration")
+        best_reg, best_blender, best_direction_blender, best_regime_models = combined_training(
+            df=df,
+            feature_store=feature_store,
+            signal_modules=feature_store.signal_modules,
+            context_modules=feature_store.context_modules,
+            models_dir=models_dir,
+            feature_cache_path=cache_path,
+            force_recompute_cache=False,
+            train_months=args.train_months,
+            val_months=args.val_months,
+            slide_months=args.slide_months,
+            embargo_days=args.embargo_days,
+            purge_bars=purge_bars,
+            horizon_bars=HORIZON_BARS,
+            label_threshold=LABEL_THRESHOLD,
+            regime_label_strategy=regime_label_strategy,
+            smoothing_window=SMOOTHING_WINDOW,
+            use_gpu=use_cuml,
+            random_state=args.seed,
+            calibration_method=calibration_method,
+            sharpening_alpha=sharpening_alpha,
+            disable_calibration=args.disable_calibration,
+            calibration_source=args.calibration_source,
+            eval_mode=args.eval_mode,
+            transaction_cost_bps=args.fee_bps,
+            # Ablation flags
+            disable_ml_features=args.disable_ml_features,
+            disable_regime_context=args.disable_regime_context,
+            disable_signal_dynamics=args.disable_signal_dynamics,
+            disable_rolling_stats=args.disable_rolling_stats,
+            disable_modules=disable_modules_list,
+            include_modules=include_modules_list,
+            include_features=include_features_list,
+            exclude_features=exclude_features_list,
+        )
+
+        # Save all models
+        best_reg.save(str(models_dir / "regime_model.pkl"))
+        best_blender.save(str(models_dir / "blender_model.pkl"))
+        print("\nWalk-forward models saved:")
+        print(f"  - {models_dir / 'regime_model.pkl'}")
+        print(f"  - {models_dir / 'blender_model.pkl'}")
+        
+        if best_direction_blender is not None:
+            best_direction_blender.save(str(models_dir / "blender_direction_model.pkl"))
+            print(f"  - {models_dir / 'blender_direction_model.pkl'}")
+        
+        # Save regime-specific models
+        regime_models_saved = []
+        for regime_name, model_r in best_regime_models.items():
+            slug = regime_name.lower().replace(" ", "_")
+            out_path = models_dir / f"blender_{slug}.pkl"
+            model_r.save(str(out_path))
+            regime_models_saved.append(f"blender_{slug}.pkl")
+            print(f"  - {out_path}")
+
+        if best_reg.feature_names:
+            save_selected_features(best_reg.feature_names, models_dir / "feature_columns.txt")
+        if best_blender.feature_names:
+            save_selected_features(best_blender.feature_names, models_dir / "blend_feature_columns.txt")
+
+        manifest = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "run_type": "walkforward",
+            "seed": args.seed,
+            "use_gpu": use_cuml,
+            "data_path": data_path,
+            "feature_cache_path": cache_path,
+            "log_path": log_path,
+            "calibration": {
+                "method": calibration_method,
+                "sharpening_alpha": sharpening_alpha,
+                "disabled": args.disable_calibration,
+                "source": args.calibration_source
+            },
+            "evaluation": {
+                "eval_mode": args.eval_mode,
+                "transaction_cost_bps": args.fee_bps
+            },
+            "ablation": {
+                "disable_ml_features": args.disable_ml_features,
+                "disable_regime_context": args.disable_regime_context,
+                "disable_signal_dynamics": args.disable_signal_dynamics,
+                "disable_rolling_stats": args.disable_rolling_stats,
+                "disable_modules": disable_modules_list,
+                "include_modules": include_modules_list,
+                "include_features": include_features_list,
+                "exclude_features": exclude_features_list,
+            },
+            "label_config": {
+                "horizon_bars": HORIZON_BARS,
+                "label_threshold": LABEL_THRESHOLD,
+                "smoothing_window": SMOOTHING_WINDOW
+            },
+            "regime_label_strategy": regime_label_strategy,
+            "walkforward": {
+                "train_months": args.train_months,
+                "val_months": args.val_months,
+                "slide_months": args.slide_months,
+                "embargo_days": args.embargo_days,
+                "purge_bars": purge_bars
+            },
+            "modules": {
+                "signal_modules": [m.name for m in feature_store.signal_modules],
+                "context_modules": [m.name for m in feature_store.context_modules]
+            },
+            "feature_columns_path": models_dir / "feature_columns.txt",
+            "blend_feature_columns_path": models_dir / "blend_feature_columns.txt",
+            "model_paths": {
+                "regime_model": models_dir / "regime_model.pkl",
+                "signal_blender": models_dir / "blender_model.pkl",
+                "direction_blender": models_dir / "blender_direction_model.pkl" if best_direction_blender is not None else None,
+                "regime_specific_signal": [models_dir / name for name in regime_models_saved]
+            },
+            "results_paths": {
+                "training_results": models_dir / "training_results.csv"
+            }
+        }
+        manifest_path = models_dir / "training_manifest.json"
+        _write_json(manifest_path, manifest)
+        print(f"\nTraining manifest saved to {manifest_path}")
+        return
     
     # 3. Merge raw price into features for labeling
     print("\nMerging raw price data into features...")
@@ -1029,8 +2122,7 @@ def main():
     
     # Extract labels
     # Use raw OHLCV data for regime labeling (not features)
-    y_regime = make_regime_labels(df)
-    y_regime = y_regime.reindex(feats.index)
+    y_regime = build_regime_labels(df, feats, regime_label_strategy)
     y_blend = df_labeled['blend_label'].reindex(feats.index).fillna(0).astype(int)
     future_returns = df_labeled['future_return'].reindex(feats.index)
     smoothed_returns = df_labeled['smoothed_return'].reindex(feats.index)
@@ -1117,6 +2209,11 @@ def main():
         'trend_up': 0, 'trend_down': 1, 'chop': 2
     }
     X_blend["regime"] = y_regime.map(regime_map).fillna(2)  # Default to chop (2)
+
+    feature_columns_path = models_dir / "feature_columns.txt"
+    blend_feature_columns_path = models_dir / "blend_feature_columns.txt"
+    save_selected_features(X_regime.columns.tolist(), feature_columns_path)
+    save_selected_features(X_blend.columns.tolist(), blend_feature_columns_path)
     
     print(f"\nValid samples: {len(X_regime)}")
     print(f"X_regime shape: {X_regime.shape}")
@@ -1189,7 +2286,7 @@ def main():
     print("TRAINING REGIME DETECTOR")
     print("="*60)
     print(f"Training on {len(X_regime_train)} samples...")
-    regime_detector = RegimeDetector(use_gpu=use_cuml)  # GPU-accelerated training
+    regime_detector = RegimeDetector(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
     regime_detector.fit(X_regime_train_scaled, y_regime_train)  # Train on scaled training set only
     
     # Validate on validation set
@@ -1206,6 +2303,9 @@ def main():
         columns=regime_detector.regime_classes
     )
     print(regime_cm_df)
+
+    regime_cm_path = results_dir / "confusion_regime.csv"
+    regime_cm_df.to_csv(regime_cm_path)
     
     print(f"\n[RegimeDetector] Validation label distribution (true):")
     for label, count in y_regime_val.value_counts().items():
@@ -1228,23 +2328,24 @@ def main():
     
     if args.use_full_pipeline:
         # Use full pipeline with pruning and diagnostics
-            signal_blender, signal_diagnostics = train_full_pipeline(
-                X_train=X_blend_train_scaled,
-                y_train=y_blend_train,
-                X_val=X_blend_val_scaled,
-                y_val=y_blend_val,
-                model_class=SignalBlender,
-                model_name="SignalBlender",
-                calibration_method=calibration_method,
-                sharpening_alpha=sharpening_alpha,
-                models_dir=models_dir,
-                results_dir=results_dir,
-                use_gpu=use_cuml
-            )
+        signal_blender, signal_diagnostics = train_full_pipeline(
+            X_train=X_blend_train_scaled,
+            y_train=y_blend_train,
+            X_val=X_blend_val_scaled,
+            y_val=y_blend_val,
+            model_class=SignalBlender,
+            model_name="SignalBlender",
+            calibration_method=calibration_method,
+            sharpening_alpha=sharpening_alpha,
+            models_dir=models_dir,
+            results_dir=results_dir,
+            use_gpu=use_cuml,
+            random_state=args.seed
+        )
     else:
         # Legacy training path
         print(f"Training on {len(X_blend_train)} samples...")
-        signal_blender = SignalBlender(use_gpu=use_cuml)  # GPU-accelerated training
+        signal_blender = SignalBlender(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
         signal_blender.fit(
             X_blend_train_scaled, 
             y_blend_train,
@@ -1276,14 +2377,21 @@ def main():
     
     # Validate on validation set
     print(f"\nValidating on {len(X_blend_val)} samples...")
-    blend_pred_val = signal_blender.predict(X_blend_val_scaled)
+    blend_proba_val = signal_blender.predict_proba(X_blend_val_scaled)
+    blend_pred_val = blend_proba_val.idxmax(axis=1).astype(int)
+    filtered_pct = 0.0
+    if args.min_trade_proba > 0:
+        max_proba = blend_proba_val.max(axis=1)
+        low_conf_mask = max_proba < args.min_trade_proba
+        blend_pred_val = blend_pred_val.where(~low_conf_mask, 0)
+        filtered_pct = float(low_conf_mask.mean()) if len(low_conf_mask) else 0.0
+        print(f"[SignalBlender] Confidence filter: min_proba={args.min_trade_proba:.2f}, filtered={filtered_pct:.2%}")
     blend_val_accuracy = accuracy_score(y_blend_val, blend_pred_val)
     
     # Analyze probability distribution after calibration
     if calibration_method:
         print(f"\nAnalyzing probability distribution (after calibration)...")
-        proba_cal = signal_blender.predict_proba(X_blend_val_scaled)
-        max_proba_cal = proba_cal.max(axis=1)
+        max_proba_cal = blend_proba_val.max(axis=1)
         _print_probability_distribution(max_proba_cal, "Calibrated probabilities")
     
     print(f"\n[SignalBlender] Validation accuracy: {blend_val_accuracy:.4f}")
@@ -1295,6 +2403,9 @@ def main():
         columns=signal_blender.signal_classes
     )
     print(blend_cm_df)
+
+    blend_cm_path = results_dir / "confusion_signal.csv"
+    blend_cm_df.to_csv(blend_cm_path)
     
     print(f"\n[SignalBlender] Validation label distribution (true):")
     for label, count in y_blend_val.value_counts().items():
@@ -1305,6 +2416,30 @@ def main():
     for label, count in blend_pred_val.value_counts().items():
         pct = count / len(blend_pred_val) * 100
         print(f"  {label}: {count} ({pct:.2f}%)")
+
+    signal_return_metrics = compute_return_metrics(
+        blend_pred_val,
+        df['close'].reindex(blend_pred_val.index),
+        horizon_bars=HORIZON_BARS,
+        eval_mode=args.eval_mode,
+        transaction_cost_bps=args.fee_bps
+    )
+    print(f"\n[SignalBlender] Return metrics (validation):")
+    print(f"  Eval mode: {signal_return_metrics['eval_mode']}")
+    print(f"  Fee (bps): {signal_return_metrics['transaction_cost_bps']:.2f}")
+    print(f"  Total cost: {signal_return_metrics['total_cost']:.6f}")
+    print(f"  Net cumulative return: {signal_return_metrics['cumulative_return']:.4f}")
+    print(f"  Gross cumulative return: {signal_return_metrics['gross_cumulative_return']:.4f}")
+    print(f"  Mean return: {signal_return_metrics['mean_return']:.6f}")
+    print(f"  Volatility: {signal_return_metrics['volatility']:.6f}")
+    print(f"  Sharpe-like: {signal_return_metrics['sharpe_like']:.4f}")
+    print(f"  Trade rate: {signal_return_metrics['trade_rate']:.2%}")
+    print(f"  Win rate: {signal_return_metrics['win_rate']:.2%}")
+    print(f"  Turnover: {signal_return_metrics['turnover']:.4f}")
+    print(f"  Profit factor: {_fmt_optional(signal_return_metrics['profit_factor'])}")
+    print(f"  Expectancy: {_fmt_optional(signal_return_metrics['expectancy'], 6)}")
+    print(f"  Max drawdown: {signal_return_metrics['max_drawdown']:.4f}")
+    print(f"  Max DD duration: {signal_return_metrics['max_drawdown_duration']}")
     
     # Save both regular and calibrated models
     signal_blender.save(str(models_dir / "blender_model.pkl"))
@@ -1372,12 +2507,13 @@ def main():
             sharpening_alpha=sharpening_alpha,
             models_dir=models_dir,
             results_dir=results_dir,
-            use_gpu=use_cuml
+            use_gpu=use_cuml,
+            random_state=args.seed
         )
     else:
         # Legacy training path
         print(f"\nTraining DirectionBlender on {len(X_blend_trade_train)} trade samples...")
-        direction_blender = DirectionBlender(use_gpu=use_cuml)  # GPU-accelerated training
+        direction_blender = DirectionBlender(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
         direction_blender.fit(
             X_blend_trade_train, 
             y_direction_train,
@@ -1428,6 +2564,9 @@ def main():
         columns=direction_blender.direction_classes
     )
     print(direction_cm_df)
+
+    direction_cm_path = results_dir / "confusion_direction.csv"
+    direction_cm_df.to_csv(direction_cm_path)
     
     print(f"\n[DirectionBlender] Validation label distribution (true):")
     for label, count in y_direction_val.value_counts().items():
@@ -1438,6 +2577,48 @@ def main():
     for label, count in direction_pred_val.value_counts().items():
         pct = count / len(direction_pred_val) * 100
         print(f"  {label}: {count} ({pct:.2f}%)")
+
+    direction_return_metrics = compute_return_metrics(
+        direction_pred_val,
+        df['close'].reindex(direction_pred_val.index),
+        horizon_bars=HORIZON_BARS,
+        eval_mode=args.eval_mode,
+        transaction_cost_bps=args.fee_bps
+    )
+    print(f"\n[DirectionBlender] Return metrics (validation):")
+    print(f"  Eval mode: {direction_return_metrics['eval_mode']}")
+    print(f"  Fee (bps): {direction_return_metrics['transaction_cost_bps']:.2f}")
+    print(f"  Total cost: {direction_return_metrics['total_cost']:.6f}")
+    print(f"  Net cumulative return: {direction_return_metrics['cumulative_return']:.4f}")
+    print(f"  Gross cumulative return: {direction_return_metrics['gross_cumulative_return']:.4f}")
+    print(f"  Mean return: {direction_return_metrics['mean_return']:.6f}")
+    print(f"  Volatility: {direction_return_metrics['volatility']:.6f}")
+    print(f"  Sharpe-like: {direction_return_metrics['sharpe_like']:.4f}")
+    print(f"  Trade rate: {direction_return_metrics['trade_rate']:.2%}")
+    print(f"  Win rate: {direction_return_metrics['win_rate']:.2%}")
+    print(f"  Turnover: {direction_return_metrics['turnover']:.4f}")
+    print(f"  Profit factor: {_fmt_optional(direction_return_metrics['profit_factor'])}")
+    print(f"  Expectancy: {_fmt_optional(direction_return_metrics['expectancy'], 6)}")
+    print(f"  Max drawdown: {direction_return_metrics['max_drawdown']:.4f}")
+    print(f"  Max DD duration: {direction_return_metrics['max_drawdown_duration']}")
+
+    metrics_payload = {
+        "regime_accuracy": float(regime_val_accuracy),
+        "signal_accuracy": float(blend_val_accuracy),
+        "direction_accuracy": float(direction_val_accuracy),
+        "signal_confidence_threshold": float(args.min_trade_proba),
+        "signal_confidence_filtered_pct": float(filtered_pct),
+        "signal_return_metrics": signal_return_metrics,
+        "direction_return_metrics": direction_return_metrics,
+        "confusion_matrices": {
+            "regime": regime_cm_path,
+            "signal": blend_cm_path,
+            "direction": direction_cm_path
+        }
+    }
+    metrics_path = results_dir / "validation_metrics.json"
+    _write_json(metrics_path, metrics_payload)
+    print(f"\nValidation metrics saved to {metrics_path}")
     
     # Save both regular and calibrated models
     direction_blender.save(str(models_dir / "blender_direction_model.pkl"))
@@ -1493,10 +2674,9 @@ def main():
             'bootstrap': True,
             'max_samples': 0.8,
             'max_features': 0.9,
-            'n_streams': 4,
-            'random_state': 42
+            'n_streams': 4
         }
-        model_r = SignalBlender(model_params=model_params, use_gpu=use_cuml)
+        model_r = SignalBlender(model_params=model_params, use_gpu=use_cuml, random_state=args.seed)
         
         print(f"Training SignalBlender[{regime_name}]...")
         model_r.fit(
@@ -1582,10 +2762,9 @@ def main():
             'bootstrap': True,
             'max_samples': 0.8,
             'max_features': 0.9,
-            'n_streams': 4,
-            'random_state': 42
+            'n_streams': 4
         }
-        model_r = DirectionBlender(model_params=model_params, use_gpu=use_cuml)
+        model_r = DirectionBlender(model_params=model_params, use_gpu=use_cuml, random_state=args.seed)
         
         print(f"Training DirectionBlender[{regime_name}]...")
         model_r.fit(
@@ -1665,7 +2844,67 @@ def main():
         for model in regime_models_direction:
             print(f"  - {model}")
 
+    # Save training manifest (always, regardless of regime-specific models)
+    manifest = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "run_type": "static",
+        "seed": args.seed,
+        "use_gpu": use_cuml,
+        "data_path": data_path,
+        "feature_cache_path": cache_path,
+        "log_path": log_path,
+        "calibration": {
+            "method": calibration_method,
+            "sharpening_alpha": sharpening_alpha,
+            "disabled": args.disable_calibration
+        },
+        "evaluation": {
+            "eval_mode": args.eval_mode,
+            "transaction_cost_bps": args.fee_bps
+        },
+        "ablation": {
+            "disable_ml_features": args.disable_ml_features,
+            "disable_regime_context": args.disable_regime_context,
+            "disable_signal_dynamics": args.disable_signal_dynamics,
+            "disable_rolling_stats": args.disable_rolling_stats,
+            "disable_modules": disable_modules_list,
+            "include_modules": include_modules_list,
+            "include_features": include_features_list,
+            "exclude_features": exclude_features_list,
+        },
+        "label_config": {
+            "horizon_bars": HORIZON_BARS,
+            "label_threshold": LABEL_THRESHOLD,
+            "smoothing_window": SMOOTHING_WINDOW
+        },
+        "regime_label_strategy": regime_label_strategy,
+        "modules": {
+            "signal_modules": [m.name for m in feature_store.signal_modules],
+            "context_modules": [m.name for m in feature_store.context_modules]
+        },
+        "paths": {
+            "feature_columns": feature_columns_path,
+            "blend_feature_columns": blend_feature_columns_path,
+            "scaler": scaler_path,
+            "metrics": metrics_path,
+            "confusion_regime": regime_cm_path,
+            "confusion_signal": blend_cm_path,
+            "confusion_direction": direction_cm_path
+        },
+        "model_paths": {
+            "regime_model": models_dir / "regime_model.pkl",
+            "signal_blender": models_dir / "blender_model.pkl",
+            "signal_blender_calibrated": (models_dir / "blender_calibrated.pkl") if calibration_method else None,
+            "direction_blender": models_dir / "blender_direction_model.pkl",
+            "direction_blender_calibrated": (models_dir / "blender_direction_calibrated.pkl") if calibration_method else None,
+            "regime_specific_signal": [models_dir / name for name in regime_models_signal],
+            "regime_specific_direction": [models_dir / name for name in regime_models_direction]
+        }
+    }
+    manifest_path = models_dir / "training_manifest.json"
+    _write_json(manifest_path, manifest)
+    print(f"\nTraining manifest saved to {manifest_path}")
+
 
 if __name__ == "__main__":
     main()
-

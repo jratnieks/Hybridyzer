@@ -194,13 +194,14 @@ class SignalBlender(BlenderBase):
     Outputs final long/short/flat labels from features.
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False, random_state: Optional[int] = None):
         """
         Initialize signal blender.
         
         Args:
             model_params: Optional cuML RandomForestClassifier parameters
             use_gpu: Whether to use GPU acceleration (default: True, falls back to CPU if unavailable)
+            random_state: Random seed for model initialization (default: 42)
         """
         if model_params is None:
             # cuML RandomForestClassifier parameters - lightweight for reduced VRAM
@@ -213,8 +214,12 @@ class SignalBlender(BlenderBase):
                 'split_criterion': 0,  # 0=GINI, 1=ENTROPY
                 'bootstrap': True,
                 'n_streams': 1,  # Critical for reproducibility and lower VRAM spikes
-                'random_state': 42
+                'random_state': random_state if random_state is not None else 42
             }
+        else:
+            # If model_params provided but random_state not set, use provided random_state
+            if random_state is not None and 'random_state' not in model_params:
+                model_params['random_state'] = random_state
         self.model_params = model_params
         self.use_gpu = use_gpu
         self.model = None
@@ -327,7 +332,7 @@ class SignalBlender(BlenderBase):
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
                 learning_rate=0.1,
-                random_state=42
+                random_state=self.model_params.get('random_state', 42)
             )
             self.model.fit(X_clean, y_numeric)
             print(f"[SignalBlender] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
@@ -382,9 +387,10 @@ class SignalBlender(BlenderBase):
             else:
                 # Auto-split 20% for validation
                 from sklearn.model_selection import train_test_split
-                print(f"[SignalBlender] Auto-splitting 20% of data for calibration validation...")
+                cal_seed = self.model_params.get('random_state', 42)
+                print(f"[SignalBlender] Auto-splitting 20% of data for calibration validation (seed={cal_seed})...")
                 X_train_cal, X_cal, y_train_cal, y_cal_numeric = train_test_split(
-                    X_clean, y_numeric, test_size=0.2, random_state=42, stratify=y_numeric
+                    X_clean, y_numeric, test_size=0.2, random_state=cal_seed, stratify=y_numeric
                 )
                 # Retrain on the 80% split (more accurate calibration)
                 print(f"[SignalBlender] Retraining on 80% split ({len(X_train_cal)} samples)...")
@@ -625,13 +631,14 @@ class DirectionBlender(BlenderBase):
     Predicts only direction (1 for long, -1 for short) on trade samples (excludes flat/0).
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False, random_state: Optional[int] = None):
         """
         Initialize direction blender.
         
         Args:
             model_params: Optional cuML RandomForestClassifier parameters
             use_gpu: Whether to use GPU acceleration (default: True, falls back to CPU if unavailable)
+            random_state: Random seed for model initialization (default: 42)
         """
         if model_params is None:
             # cuML RandomForestClassifier parameters - lightweight for reduced VRAM
@@ -644,8 +651,12 @@ class DirectionBlender(BlenderBase):
                 'split_criterion': 0,  # 0=GINI, 1=ENTROPY
                 'bootstrap': True,
                 'n_streams': 1,  # Critical for reproducibility and lower VRAM spikes
-                'random_state': 42
+                'random_state': random_state if random_state is not None else 42
             }
+        else:
+            # If model_params provided but random_state not set, use provided random_state
+            if random_state is not None and 'random_state' not in model_params:
+                model_params['random_state'] = random_state
         self.model_params = model_params
         self.use_gpu = use_gpu
         self.model = None
@@ -757,7 +768,7 @@ class DirectionBlender(BlenderBase):
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
                 learning_rate=0.1,
-                random_state=42
+                random_state=self.model_params.get('random_state', 42)
             )
             self.model.fit(X_clean, y_numeric)
             print(f"[DirectionBlender] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
@@ -812,9 +823,10 @@ class DirectionBlender(BlenderBase):
             else:
                 # Auto-split 20% for validation
                 from sklearn.model_selection import train_test_split
-                print(f"[DirectionBlender] Auto-splitting 20% of data for calibration validation...")
+                cal_seed = self.model_params.get('random_state', 42)
+                print(f"[DirectionBlender] Auto-splitting 20% of data for calibration validation (seed={cal_seed})...")
                 X_train_cal, X_cal, y_train_cal, y_cal_numeric = train_test_split(
-                    X_clean, y_numeric, test_size=0.2, random_state=42, stratify=y_numeric
+                    X_clean, y_numeric, test_size=0.2, random_state=cal_seed, stratify=y_numeric
                 )
                 # Retrain on the 80% split (more accurate calibration)
                 print(f"[DirectionBlender] Retraining on 80% split ({len(X_train_cal)} samples)...")

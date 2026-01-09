@@ -28,13 +28,14 @@ class RegimeDetector:
     Falls back to CPU (pandas) if cuML is unavailable.
     """
 
-    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False):
+    def __init__(self, model_params: Optional[dict] = None, use_gpu: bool = False, random_state: Optional[int] = None):
         """
         Initialize regime detector.
 
         Args:
             model_params: Optional cuML/CPU RandomForestClassifier parameters
             use_gpu: Whether to use GPU acceleration (default: False; requires explicit flag)
+            random_state: Random seed for model initialization (default: 42)
         """
         if model_params is None:
             # cuML RandomForestClassifier parameters
@@ -47,8 +48,12 @@ class RegimeDetector:
                 'max_samples': 0.8,
                 'max_features': 0.9,
                 'n_streams': 4,
-                'random_state': 42
+                'random_state': random_state if random_state is not None else 42
             }
+        else:
+            # If model_params provided but random_state not set, use provided random_state
+            if random_state is not None and 'random_state' not in model_params:
+                model_params['random_state'] = random_state
         self.model_params = model_params
         self.use_gpu = use_gpu
         self.model = None
@@ -125,7 +130,7 @@ class RegimeDetector:
             self.model = RandomForestClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
-                random_state=42,
+                random_state=self.model_params.get('random_state', 42),
                 n_jobs=-1
             )
             self.model.fit(X_clean, y_numeric)

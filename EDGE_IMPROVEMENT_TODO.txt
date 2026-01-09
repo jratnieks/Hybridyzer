@@ -1,0 +1,81 @@
+EDGE IMPROVEMENT TODO
+How to use: replace [ ] with [x] when complete. Keep notes under each section.
+
+Goals and constraints
+[ ] Define trading style (day trading, short hold, no overnight) and acceptable drawdown.
+[ ] Define target metrics (median return >= X, max drawdown <= Y, trade count >= Z).
+[ ] Define cost model (fee_bps + slippage assumptions).
+[ ] Define evaluation mode (nonoverlap vs per-bar) and keep it consistent.
+
+Baseline snapshot (fill in each run)
+[ ] Record data timeframe and date range.
+[ ] Record training flags used (horizon_bars, smoothing_window, label_threshold, eval_mode, fee_bps).
+[ ] Record walk-forward windows (train/val/slide months).
+[ ] Record summary stats (avg/median return, win rate, trade count).
+[ ] Save top/bottom windows and notes on outliers.
+
+1) Evaluation and metrics (make edge measurable)
+[x] Add median and trimmed-mean return across windows to training_results summary.
+[x] Add drawdown metrics (max drawdown, time-to-recovery) to validation report.
+[x] Add trade metrics (profit factor, expectancy, avg trade return, turnover).
+[x] Add net vs gross returns with explicit cost model.
+[x] Add embargo/purged walk-forward option to reduce leakage.
+[x] Add stability score (e.g., % of windows positive, interquartile range).
+
+2) Labeling and horizon search (largest leverage)
+[x] Grid search horizon_bars and smoothing_window across 5m data.
+[ ] Implement triple-barrier labels (time, stop, take-profit) and compare.
+[ ] Try volatility-scaled label thresholds (ATR or realized vol).
+[ ] Explore asymmetric thresholds (different for long vs short).
+[ ] Try alternative label smoothing (EMA vs rolling mean).
+
+3) Feature expansion (edge discovery)
+[ ] Add volatility regime features (realized vol, ATR z-score, vol-of-vol).
+[ ] Add trend strength features (slope + distance from MA, ADX-like proxy).
+[ ] Add range compression/breakout pressure (range vs ATR, Bollinger width).
+[ ] Add time-of-day and day-of-week features (seasonality).
+[ ] Add volume surprise/divergence features (volume z-score, price-volume divergence).
+[ ] Add return structure features (lags, skew, kurtosis).
+[ ] Add momentum exhaustion features (RSI slope, MACD slope).
+
+4) Filtering and confidence (trade selection)
+[ ] Raise min_trade_proba and measure effect on net returns.
+[ ] Add a meta-model to predict trade quality and gate trades.
+[ ] Use regime-specific blenders in production and compare to global blender.
+[ ] Add no-trade zones (e.g., low volatility or high spread).
+
+5) Risk and execution realism
+[ ] Add volatility-scaled position sizing and cap leverage.
+[ ] Add max daily loss or pause trading on drawdown spikes.
+[ ] Add slippage model (bps per trade or per bar).
+[ ] Add time-based stop (exit after N bars if no move).
+
+6) Continuous process
+[ ] Run a weekly walk-forward batch (grid of configs).
+[ ] Select configs by stability (median, drawdown) not just max return.
+[ ] Retrain on a schedule (monthly/quarterly) and track drift.
+[ ] Keep a changelog of config changes and results.
+
+7) Data and timeframe experiments
+[ ] Compare 5m vs 15m data.
+[ ] Try 2-4 years vs full history for stability.
+[ ] Validate on most recent year as a holdout.
+[ ] Test split by regime (bull/bear/sideways periods).
+
+Run templates (fill in and keep for reference)
+Run A:
+[ ] Command:
+[ ] Summary:
+[ ] Notes:
+
+Run B:
+[ ] Command:
+[ ] Summary:
+[ ] Notes:
+
+Decision checklist before deploying a model
+[ ] Stable median return across windows.
+[ ] Reasonable trade count and turnover.
+[ ] Drawdown within tolerance.
+[ ] Performance holds on most recent year.
+[ ] Costs and slippage included.

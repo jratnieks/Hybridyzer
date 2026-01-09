@@ -309,8 +309,8 @@ def main():
                         help='Minimum expected value threshold. Only allow trades with EV >= min_ev (requires --calibration-csv)')
     parser.add_argument('--calibration-csv', type=str, default=None,
                         help='Path to calibration CSV file (e.g., results/calibration_overall_*.csv) for EV filtering')
-    parser.add_argument('--horizon-bars', type=int, default=48,
-                        help='Forward horizon in bars for label generation (default: 48 = 4 hours for 5-min data)')
+    parser.add_argument('--horizon-bars', type=int, default=12,
+                        help='Forward horizon in bars for label generation (default: 12 = 1 hour for 5-min data)')
     parser.add_argument('--label-threshold', type=float, default=0.0005,
                         help='Threshold for direction labels (default: 0.0005 = 0.05%)')
     parser.add_argument('--dump-ev-analysis', action='store_true',
@@ -390,27 +390,41 @@ def main():
 
     # 1. Load raw BTC CSV
     print("Loading BTC data...")
-    csv_paths = [
-        data_dir / "btcusd_4H.csv",
-        data_dir / "btcusd_1min.csv",
-        data_dir / "btc_1m.csv",
-    ]
+    
+    # Prefer split test dataset, then fall back to single file
+    test_path = data_dir / "btcusd_5min_test_2024.csv"
+    test_2025_path = data_dir / "btcusd_5min_test_2025.csv"
     
     df_full = None
-    for path in csv_paths:
-        if Path(path).exists():
-            df_full = load_btc_csv(str(path))
-            print(f"Loaded {len(df_full)} bars from {path}")
-            break
+    if test_path.exists():
+        df_full = load_btc_csv(str(test_path))
+        print(f"Loaded test set: {len(df_full)} bars from {test_path}")
+    elif test_2025_path.exists():
+        df_full = load_btc_csv(str(test_2025_path))
+        print(f"Loaded test set: {len(df_full)} bars from {test_2025_path}")
+    else:
+        # Fall back to single file
+        csv_paths = [
+            data_dir / "btcusd_5min.csv",
+            data_dir / "btcusd_4H.csv",
+            data_dir / "btcusd_1min.csv",
+            data_dir / "btc_1m.csv",
+        ]
+        
+        for path in csv_paths:
+            if Path(path).exists():
+                df_full = load_btc_csv(str(path))
+                print(f"Loaded {len(df_full)} bars from {path}")
+                break
 
-    if df_full is None:
-        # Try to find any CSV in data directory
-        csv_files = list(data_dir.glob("*.csv"))
-        if csv_files:
-            df_full = load_btc_csv(str(csv_files[0]))
-            print(f"Loaded {len(df_full)} bars from {csv_files[0]}")
-        else:
-            raise FileNotFoundError("No BTC CSV file found in data/ directory")
+        if df_full is None:
+            # Try to find any CSV in data directory
+            csv_files = list(data_dir.glob("*.csv"))
+            if csv_files:
+                df_full = load_btc_csv(str(csv_files[0]))
+                print(f"Loaded {len(df_full)} bars from {csv_files[0]}")
+            else:
+                raise FileNotFoundError("No BTC CSV file found in data/ directory")
     
     # 2. Build features with FeatureStore (same settings as train.py)
     use_cuml = args.use_cuml

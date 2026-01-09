@@ -20,9 +20,10 @@ Features:
 """
 
 from __future__ import annotations
+import re
 import pandas as pd
 import numpy as np
-from typing import List
+from typing import List, Optional
 from pathlib import Path
 import time
 from modules.base import SignalModule, ContextModule
@@ -31,6 +32,7 @@ from modules.trendmagic import TrendMagicV2
 from modules.pvt_eliminator import PVTEliminator
 from modules.pivots_rsi import PivotRSIContext
 from modules.linreg_channel import LinRegChannelContext
+from modules.ohlcv_context import OHLCVContext
 
 # GPU support with automatic CPU fallback
 # Uses RAPIDS cuDF for GPU-accelerated operations (works in WSL/Linux)
@@ -1211,7 +1213,16 @@ class FeatureStore:
         rolling_stats_columns: List[str] = None,
         safe_mode: bool = True,
         use_gpu: bool = True,
-        chunk_size: int = 100000
+        chunk_size: int = 100000,
+        # Ablation flags (disable specific feature groups for A/B testing)
+        disable_ml_features: bool = False,
+        disable_regime_context: bool = False,
+        disable_signal_dynamics: bool = False,
+        disable_rolling_stats: bool = False,
+        disable_modules: List[str] = None,  # e.g., ["superma", "trendmagic"]
+        include_modules: Optional[List[str]] = None,  # e.g., ["superma"]
+        include_features: Optional[List[str]] = None,  # regex patterns
+        exclude_features: Optional[List[str]] = None,  # regex patterns
     ):
         """
         Initialize feature store.
@@ -1225,6 +1236,14 @@ class FeatureStore:
             safe_mode: Enable safe mode optimizations (default: True)
             use_gpu: Whether to use GPU acceleration (default: True, falls back to CPU if unavailable)
             chunk_size: Number of rows to process per chunk for large datasets (default: 100000)
+            disable_ml_features: Disable ML feature generation for ablation testing
+            disable_regime_context: Disable regime context features for ablation testing
+            disable_signal_dynamics: Disable signal dynamics features for ablation testing
+            disable_rolling_stats: Disable rolling statistics for ablation testing
+            disable_modules: List of module names to disable (e.g., ["superma", "trendmagic"])
+            include_modules: Optional list of module names to keep (others disabled)
+            include_features: Optional list of regex patterns to include
+            exclude_features: Optional list of regex patterns to exclude
         """
         self.safe_mode = safe_mode
         self.use_gpu = use_gpu
@@ -1232,16 +1251,119 @@ class FeatureStore:
         self.features = pd.DataFrame()
         self.feature_columns = []
         
+        # Store ablation flags
+        self.disable_ml_features = disable_ml_features
+        self.disable_regime_context_flag = disable_regime_context
+        self.disable_signal_dynamics_flag = disable_signal_dynamics
+        self.disable_rolling_stats_flag = disable_rolling_stats
+        self.disable_modules = set(m.lower() for m in (disable_modules or []))
+        self.include_modules = set(m.lower() for m in (include_modules or []))
+        self.include_feature_patterns = self._compile_feature_patterns(include_features)
+        self.exclude_feature_patterns = self._compile_feature_patterns(exclude_features)
+        
+        # Log ablation settings
+        ablation_active = []
+        if disable_ml_features:
+            ablation_active.append("ml_features")
+        if disable_regime_context:
+            ablation_active.append("regime_context")
+        if disable_signal_dynamics:
+            ablation_active.append("signal_dynamics")
+        if disable_rolling_stats:
+            ablation_active.append("rolling_stats")
+        if self.disable_modules:
+            ablation_active.append(f"modules:{','.join(sorted(self.disable_modules))}")
+        if self.include_modules:
+            ablation_active.append(f"include_modules:{','.join(sorted(self.include_modules))}")
+        if self.include_feature_patterns:
+            ablation_active.append("include_features")
+        if self.exclude_feature_patterns:
+            ablation_active.append("exclude_features")
+        
+        if ablation_active:
+            print(f"[FeatureStore] ABLATION MODE: disabled [{', '.join(ablation_active)}]")
+        
         # Default modules (CPU-based, lightweight)
-        self.signal_modules = [
+        all_signal_modules = [
             SuperMA4hr(),
             TrendMagicV2(),
             PVTEliminator(),
         ]
-        self.context_modules = [
+        all_context_modules = [
             PivotRSIContext(),
             LinRegChannelContext(),
+            OHLCVContext(),
         ]
+        
+        # Filter modules (include_modules acts as a whitelist when provided)
+        if self.include_modules:
+            self.signal_modules = [
+                m for m in all_signal_modules
+                if m.name.lower() in self.include_modules and m.name.lower() not in self.disable_modules
+            ]
+            self.context_modules = [
+                m for m in all_context_modules
+                if m.name.lower() in self.include_modules and m.name.lower() not in self.disable_modules
+            ]
+        else:
+            self.signal_modules = [
+                m for m in all_signal_modules
+                if m.name.lower() not in self.disable_modules
+            ]
+            self.context_modules = [
+                m for m in all_context_modules
+                if m.name.lower() not in self.disable_modules
+            ]
+        
+        if self.include_modules:
+            print(f"[FeatureStore] Using include_modules: {sorted(self.include_modules)}")
+        if self.disable_modules:
+            disabled_signal = [m.name for m in all_signal_modules if m.name.lower() in self.disable_modules]
+            disabled_context = [m.name for m in all_context_modules if m.name.lower() in self.disable_modules]
+            if disabled_signal:
+                print(f"[FeatureStore] Disabled signal modules: {disabled_signal}")
+            if disabled_context:
+                print(f"[FeatureStore] Disabled context modules: {disabled_context}")
+        if self.include_feature_patterns or self.exclude_feature_patterns:
+            print("[FeatureStore] Feature filtering enabled (include/exclude patterns)")
+
+    @staticmethod
+    def _compile_feature_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
+        if not patterns:
+            return []
+        compiled = []
+        for pattern in patterns:
+            if not pattern:
+                continue
+            compiled.append(re.compile(pattern))
+        return compiled
+
+    def _apply_feature_filters(self, features: pd.DataFrame) -> pd.DataFrame:
+        if not self.include_feature_patterns and not self.exclude_feature_patterns:
+            return features
+
+        columns = list(features.columns)
+        if self.include_feature_patterns:
+            keep = [
+                col for col in columns
+                if any(p.search(col) for p in self.include_feature_patterns)
+            ]
+        else:
+            keep = columns
+
+        if self.exclude_feature_patterns:
+            keep = [
+                col for col in keep
+                if not any(p.search(col) for p in self.exclude_feature_patterns)
+            ]
+
+        filtered = features[keep]
+        dropped = len(columns) - len(filtered.columns)
+        if dropped > 0:
+            print(f"[FeatureStore] Feature filters dropped {dropped} columns")
+        if filtered.shape[1] == 0:
+            raise ValueError("Feature filters removed all features; adjust include/exclude patterns.")
+        return filtered
         
         # Apply safe_mode defaults
         if safe_mode:
@@ -1255,36 +1377,38 @@ class FeatureStore:
                 rolling_windows = [5, 20]  # Still use reduced windows by default
         
         # Rolling stats generator (GPU-accelerated)
-        self.generate_rolling_stats = generate_rolling_stats
+        # Respect both explicit flag and ablation flag
+        self.generate_rolling_stats = generate_rolling_stats and not disable_rolling_stats
         self.rolling_stats_columns = rolling_stats_columns
         self.rolling_stats_generator = RollingStatsGenerator(
             windows=rolling_windows,
             rolling_stats_columns=rolling_stats_columns,
             use_gpu=use_gpu,
             chunk_size=chunk_size
-        ) if generate_rolling_stats else None
+        ) if self.generate_rolling_stats else None
         
         # Regime context features generator (GPU-accelerated)
-        self.generate_regime_context = generate_regime_context
+        # Respect both explicit flag and ablation flag
+        self.generate_regime_context = generate_regime_context and not disable_regime_context
         self.regime_context_generator = RegimeContextFeatures(
             use_gpu=use_gpu,
             chunk_size=chunk_size
-        ) if generate_regime_context else None
+        ) if self.generate_regime_context else None
         
         # Signal dynamics features generator (GPU-accelerated for distance-to-extreme)
-        self.generate_signal_dynamics = True
+        self.generate_signal_dynamics = not disable_signal_dynamics
         self.signal_dynamics_generator = SignalDynamicsFeatures(
             signal_modules=self.signal_modules,
             use_gpu=use_gpu,
             chunk_size=chunk_size
-        )
+        ) if self.generate_signal_dynamics else None
         
         # ML features generator (GPU-accelerated)
-        self.generate_ml_features = True
+        self.generate_ml_features = not disable_ml_features
         self.ml_features_generator = MLFeatures(
             use_gpu=use_gpu,
             chunk_size=chunk_size
-        )
+        ) if self.generate_ml_features else None
 
     def build(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1421,7 +1545,7 @@ class FeatureStore:
                 # Clear GPU memory after regime context generation
                 clear_gpu_memory()
         
-        # Generate signal dynamics features if enabled
+        # Generate signal dynamics features if enabled (and not disabled via ablation)
         if self.generate_signal_dynamics and self.signal_dynamics_generator is not None:
             # Aggressive GPU memory clear before signal dynamics
             clear_gpu_memory(aggressive=True)
@@ -1475,6 +1599,9 @@ class FeatureStore:
             for col in numeric_cols:
                 unified_features[col] = unified_features[col].astype(np.float32)
         
+        # Apply include/exclude filters
+        unified_features = self._apply_feature_filters(unified_features)
+
         # Global feature cap check
         if unified_features.shape[1] > MAX_FEATURES:
             raise RuntimeError(
@@ -1554,6 +1681,9 @@ class FeatureStore:
         # Ensure all features align on the same index
         unified_features = unified_features.reindex(df.index)
         
+        # Apply include/exclude filters
+        unified_features = self._apply_feature_filters(unified_features)
+
         # Store feature columns for reference
         self.feature_columns = unified_features.columns.tolist()
         self.features = unified_features
@@ -1673,4 +1803,3 @@ class FeatureStore:
         Return a time-sliced view of cached features without recomputation.
         """
         return features[(features.index >= start_ts) & (features.index < end_ts)]
-

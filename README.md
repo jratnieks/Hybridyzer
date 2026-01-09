@@ -41,11 +41,69 @@ Hybridyzer is a sophisticated trading system that:
 pip install -r requirements.txt
 ```
 
+**GPU (WSL/Linux) recommended:** use the conda environment in `environment.runpod.yml`
+to avoid RAPIDS binary incompatibilities (pyarrow/numpy are pinned there).
+
 ### Requirements
 
 - pandas >= 2.0.0
 - numpy >= 1.24.0
 - lightgbm >= 4.0.0
+
+## RunPod GPU Setup
+
+For GPU-accelerated training on RunPod, use the provided conda environment file that includes RAPIDS (cuML/cuDF) for CUDA 12, Python 3.10, and RAPIDS 24.08.
+
+### Setup Steps
+
+1. **Install micromamba** (or conda):
+   ```bash
+   curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+   ```
+
+2. **Create the environment**:
+   ```bash
+   micromamba env create -f environment.runpod.yml
+   ```
+
+3. **Activate the environment**:
+   ```bash
+   micromamba activate hybridyzer
+   ```
+
+4. **Run training**:
+   ```bash
+   python train.py --runpod --use-full-pipeline --calibration-method isotonic --alpha 2.0
+   ```
+
+**WSL/local GPU:** same env file works; run from the repo root without `--runpod`.
+
+### VRAM Optimization
+
+If you encounter low VRAM issues:
+- Drop `--use-full-pipeline` flag, or
+- Add `--disable-calibration` flag
+
+### Data Path
+
+The system expects data files in `/workspace/Hybridyzer/data/` with the following naming convention:
+- **Split datasets (preferred for training/evaluation):**
+  - `btcusd_5min_train_2017_2022.csv` - Training set (2017-2022)
+  - `btcusd_5min_val_2023.csv` - Validation set (2023)
+  - `btcusd_5min_test_2024.csv` - Test set (2024)
+  - `btcusd_5min_test_2025.csv` - Optional test set (2025)
+- **Single file fallback:**
+  - `btcusd_5min.csv` - Combined 5-minute data
+  - `btcusd_4H.csv` - 4-hour data
+  - `btcusd_1min.csv` - 1-minute data
+  - Other timeframes following the same pattern
+
+**Note:** The default classification horizon is 12 bars (1 hour for 5-minute data). Labels are generated from each split's own data to prevent leakage.
+
+### Notes
+
+- **cuML/cuDF**: GPU-accelerated libraries are included via the environment file and automatically replace CPU-based operations when available.
+- **CPU users**: If you're not using GPU, you can ignore `environment.runpod.yml` and simply run `pip install -r requirements.txt` as described in the standard installation.
 
 ## Usage
 
@@ -56,12 +114,15 @@ python train.py
 ```
 
 This will:
-1. Load BTC OHLCV data from `data/btcusd_1min_volspikes.csv`
+1. Load BTC OHLCV data from split datasets (`btcusd_5min_train_2017_2022.csv` and `btcusd_5min_val_2023.csv`) or fall back to single file
 2. Build comprehensive features from all modules
 3. Generate regime labels (rule-based)
-4. Generate blender labels (future returns)
+4. Generate blender labels (future returns over 1-hour horizon for 5-min data)
 5. Train RegimeDetector and SignalBlender models
 6. Save models to `models/`
+
+To include trading costs in validation metrics, set `--fee-bps` (e.g., `--fee-bps 1.0` for 1 bp per entry/exit).
+To reduce over-trading, set `--min-trade-proba` (e.g., `--min-trade-proba 0.60` to only trade on higher-confidence signals).
 
 ### Running Inference
 

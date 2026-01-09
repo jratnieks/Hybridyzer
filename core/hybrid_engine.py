@@ -19,8 +19,8 @@ class HybridEngine:
         self,
         signal_modules: List[SignalModule],
         context_modules: Optional[List[ContextModule]] = None,
-        regime_model_path: str = "models/regime_detector.pkl",
-        blender_model_path: str = "models/signal_blender.pkl"
+        regime_model_path: str = "models/regime_model.pkl",
+        blender_model_path: str = "models/blender_model.pkl"
     ):
         """
         Initialize the hybrid engine with modules and load ML models.
@@ -78,8 +78,8 @@ class HybridEngine:
             df, self.signal_modules, self.context_modules
         )
         
-        # Step 2: Detect regime (pass price_df for ATR calculation)
-        regime = self.regime_detector.detect_regime(features, price_df=df)
+        # Step 2: Detect regime
+        regime = self.regime_detector.predict(features)
         
         # Step 3: Compute signals from each signal module
         module_signals = {}
@@ -94,9 +94,19 @@ class HybridEngine:
             module_confidences[module.name] = module.compute_confidence(module_features)
         
         # Step 4: Blend signals based on regime
-        blended_signal = self.signal_blender.blend_signals(
-            module_signals, regime, module_confidences
-        )
+        # Prepare features for signal blender (features + signals + regime)
+        features_signals = features.copy()
+        for module_name, signal in module_signals.items():
+            # Align signal to features index
+            aligned_signal = signal.reindex(features.index).fillna(0)
+            features_signals[f"{module_name}_signal"] = aligned_signal
+        # Add regime (encode as numeric for blender)
+        regime_map = {'trend_up': 0, 'trend_down': 1, 'chop': 2}
+        regime_encoded = regime.map(regime_map).fillna(2)
+        features_signals["regime"] = regime_encoded
+        
+        # Predict blended signal
+        blended_signal = self.signal_blender.predict(features_signals)
         
         # Step 5: Apply risk layer
         final_signal = self.risk_layer.apply_risk(blended_signal, df)

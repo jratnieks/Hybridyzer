@@ -3,7 +3,7 @@
 Functions to generate labels for training regime detector and signal blender.
 
 NEW LABEL SYSTEM (v2):
-- Forward return over configurable horizon (default: 48 bars = 4 hours for 5-min data)
+- Forward return over configurable horizon (default: 12 bars = 1 hour for 5-min data)
 - 12-bar rolling mean smoothing to remove micro-noise
 - Fixed threshold classification (default: 0.0005)
 - No ATR normalization or volatility adjustments
@@ -17,7 +17,7 @@ from core.regime_detector import wilder_atr
 
 def make_direction_labels(
     df: pd.DataFrame,
-    horizon_bars: int = 48,
+    horizon_bars: int = 12,
     label_threshold: float = 0.0005,
     smoothing_window: int = 12,
     debug: bool = True
@@ -30,7 +30,7 @@ def make_direction_labels(
     
     Args:
         df: OHLCV DataFrame with 'close' column
-        horizon_bars: Forward horizon in bars (default: 48 = 4 hours for 5-min data)
+        horizon_bars: Forward horizon in bars (default: 12 = 1 hour for 5-min data)
         label_threshold: Threshold for label assignment (default: 0.0005 = 0.05%)
         smoothing_window: Rolling window for smoothing returns (default: 12)
         debug: Whether to print label statistics (default: True)
