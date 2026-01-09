@@ -198,6 +198,16 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - Fixed `faulthandler.enable()` to target the log file handle (avoids `_Tee` fileno errors)
 - Ran nightly GPU job: `results/nightly/20260109_060121` (no runs met drawdown constraint)
 
+### 2026-01-09: RunPod Deployment Prep
+- Added `setup_runpod.sh` for easy environment setup on network volume
+- Committed all core changes to master (de4ce08)
+- Key files for RunPod:
+  - `environment.runpod.yml` - conda env with RAPIDS 24.08
+  - `--runpod` flag on `train.py` and `backtest.py` sets base path to `/workspace/Hybridyzer`
+  - Data files (CSV) must be copied separately to `data/` (not in git)
+- Training command: `python train.py --runpod --walkforward`
+- Nightly runner: `python tools/nightly_runner.py --time-budget-hours 8 --promote-best`
+
 ---
 
 ## File Reference
