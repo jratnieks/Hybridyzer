@@ -14,12 +14,92 @@ import random
 import sys
 import time
 import traceback
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix
+
+
+class TrainingHeartbeat:
+    """
+    Background thread that prints status updates every N seconds.
+    Works during long model.fit() calls on both CPU and GPU.
+    """
+    
+    def __init__(self, interval_seconds: int = 30):
+        self.interval = interval_seconds
+        self.state = {
+            'window': 0,
+            'total_windows': 0,
+            'step': 'initializing',
+            'start_time': time.time(),
+            'window_start_time': time.time(),
+            'last_window_time': None,
+        }
+        self._stop_event = threading.Event()
+        self._thread = None
+    
+    def _heartbeat_loop(self):
+        """Background loop that prints status."""
+        while not self._stop_event.wait(self.interval):
+            self._print_status()
+    
+    def _print_status(self):
+        """Print current training status."""
+        now = datetime.now().strftime('%H:%M:%S')
+        elapsed = time.time() - self.state['start_time']
+        elapsed_str = f"{int(elapsed // 3600)}h {int((elapsed % 3600) // 60)}m {int(elapsed % 60)}s"
+        
+        window = self.state['window']
+        total = self.state['total_windows']
+        step = self.state['step']
+        
+        # Calculate ETA based on last window time
+        if self.state['last_window_time'] and window > 0:
+            avg_window = self.state['last_window_time']
+            remaining = total - window
+            eta_seconds = avg_window * remaining
+            eta_str = f"{int(eta_seconds // 3600)}h {int((eta_seconds % 3600) // 60)}m {int(eta_seconds % 60)}s"
+        else:
+            eta_str = "calculating..."
+        
+        # Window elapsed time
+        window_elapsed = time.time() - self.state['window_start_time']
+        window_elapsed_str = f"{int(window_elapsed // 60)}m {int(window_elapsed % 60)}s"
+        
+        print(f"\n[Heartbeat {now}] Window {window}/{total} | Step: {step} | Window time: {window_elapsed_str} | Total: {elapsed_str} | ETA: {eta_str}")
+        sys.stdout.flush()
+    
+    def start(self, total_windows: int):
+        """Start the heartbeat thread."""
+        self.state['total_windows'] = total_windows
+        self.state['start_time'] = time.time()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._thread.start()
+        print(f"[Heartbeat] Started - will report every {self.interval}s")
+        sys.stdout.flush()
+    
+    def stop(self):
+        """Stop the heartbeat thread."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        print("[Heartbeat] Stopped")
+        sys.stdout.flush()
+    
+    def update(self, window: int = None, step: str = None, window_time: float = None):
+        """Update heartbeat state."""
+        if window is not None:
+            self.state['window'] = window
+            self.state['window_start_time'] = time.time()
+        if step is not None:
+            self.state['step'] = step
+        if window_time is not None:
+            self.state['last_window_time'] = window_time
 
 
 def _print_probability_distribution(proba: np.ndarray, label: str) -> None:
@@ -1280,8 +1360,13 @@ def combined_training(
     start_time = time.time()
     window_times = []
     
+    # Start heartbeat thread for live progress updates
+    heartbeat = TrainingHeartbeat(interval_seconds=30)
+    heartbeat.start(total_windows=len(splits))
+    
     # Walk-forward training
     for i, (train_start, train_end, val_start, val_end) in enumerate(splits, 1):
+        heartbeat.update(window=i, step="starting window")
         window_start_time = time.time()
         
         # Progress bar
@@ -1325,6 +1410,7 @@ def combined_training(
 
         # Train on window using cached features to prevent repeated computation
         train_start_time = time.time()
+        heartbeat.update(step="training models")
         print(f"Training models... (started at {datetime.now().strftime('%H:%M:%S')})")
         sys.stdout.flush()
         try:
@@ -1398,6 +1484,7 @@ def combined_training(
 
         # Validate on window
         val_start_time = time.time()
+        heartbeat.update(step="validating")
         print(f"Validating models... (started at {datetime.now().strftime('%H:%M:%S')})")
         sys.stdout.flush()
         try:
@@ -1434,6 +1521,7 @@ def combined_training(
             window_time = time.time() - window_start_time
             window_times.append(window_time)
             avg_window_time = np.mean(window_times[-10:]) if len(window_times) > 0 else window_time  # Last 10 windows
+            heartbeat.update(step="completed", window_time=avg_window_time)
             val_elapsed = time.time() - val_start_time
             print(f"  Validation completed in {val_elapsed:.1f}s")
             print(f"  Window completed in {window_time:.1f}s (avg: {avg_window_time:.1f}s)")
@@ -1523,6 +1611,9 @@ def combined_training(
             )
         else:
             raise ValueError("Cannot create final models - no successful training")
+    
+    # Stop heartbeat before returning
+    heartbeat.stop()
     
     return best_reg, best_blender, best_direction_blender, best_regime_models
 
