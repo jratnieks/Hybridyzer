@@ -1,0 +1,133 @@
+================================================================================
+HYBRIDYZER QUICKSTART GUIDE
+================================================================================
+
+================================================================================
+LOCAL (WSL/Windows)
+================================================================================
+
+FIRST TIME SETUP:
+-----------------
+cd ~/Projects/Hybridyzer
+conda env create -f environment.runpod.yml -y
+conda activate hybridyzer
+
+EVERY TIME:
+-----------
+conda activate hybridyzer
+
+TRAINING COMMANDS:
+------------------
+# Single walk-forward run (basic)
+python train.py --walkforward
+
+# Nightly runner with Thompson sampling (8 hours, auto-promotes best)
+python tools/nightly_runner.py --time-budget-hours 8 --promote-best --bandit-thompson
+
+# Quick test run (2 hours)
+python tools/nightly_runner.py --time-budget-hours 2 --bandit-thompson
+
+# Force GPU (if RAPIDS installed)
+python train.py --walkforward --gpu
+
+
+================================================================================
+RUNPOD
+================================================================================
+
+FIRST TIME SETUP:
+-----------------
+cd /workspace
+git clone https://github.com/jratnieks/Hybridyzer.git
+cd Hybridyzer
+
+# Option A: Pip (quick, simpler)
+pip install -r requirements_runpod.txt --extra-index-url=https://pypi.nvidia.com
+
+# Option B: Conda (more reliable for RAPIDS)
+export MAMBA_ROOT_PREFIX=/workspace/mamba
+micromamba env create -f environment.runpod.yml -y
+micromamba activate hybridyzer
+
+# Upload data
+scp -P <PORT> -i ~/.ssh/id_ed25519 data/*.parquet root@<IP>:/workspace/Hybridyzer/data/
+
+EVERY TIME (new session):
+-------------------------
+cd /workspace/Hybridyzer
+git pull origin master
+
+# If using conda:
+micromamba activate hybridyzer
+
+TRAINING COMMANDS:
+------------------
+# Single walk-forward run with GPU
+python train.py --runpod --walkforward --gpu
+
+# Nightly runner (8 hours, Thompson sampling)
+python tools/nightly_runner.py --time-budget-hours 8 --promote-best --bandit-thompson
+
+# Longer run (24 hours overnight)
+python tools/nightly_runner.py --time-budget-hours 24 --promote-best --bandit-thompson
+
+# Background run (keeps running after disconnect)
+nohup python tools/nightly_runner.py --time-budget-hours 24 --promote-best --bandit-thompson > training.log 2>&1 &
+
+# Monitor background run
+tail -f training.log
+
+
+================================================================================
+USEFUL COMMANDS
+================================================================================
+
+# Check GPU status
+nvidia-smi
+
+# Check if RAPIDS is working
+python -c "import cudf; print('cuDF OK'); import cuml; print('cuML OK')"
+
+# Check training progress (heartbeat prints every 30s automatically)
+# If running in background:
+tail -f training.log
+
+# Kill background training
+pkill -f nightly_runner
+
+# Check disk space
+df -h
+
+# Download results from RunPod (run locally)
+scp -P <PORT> -i ~/.ssh/id_ed25519 -r root@<IP>:/workspace/Hybridyzer/results/ ./results_runpod/
+
+
+================================================================================
+ESTIMATED TIMES (per walk-forward run, 77 windows)
+================================================================================
+
+GPU (3090/4090):     ~1-2 hours per run
+CPU (sklearn):       ~4-5 hours per run
+
+8-hour budget:       ~4-8 runs (GPU) or 1-2 runs (CPU)
+24-hour budget:      ~12-24 runs (GPU) or 4-6 runs (CPU)
+
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+"RAPIDS not installed" / "[CPU] sklearn backend active":
+  -> RAPIDS not installed or not working
+  -> Reinstall: pip install cudf-cu12 cuml-cu12 --extra-index-url=https://pypi.nvidia.com
+
+"No space left on device":
+  -> Pod storage full, use network volume
+  -> export MAMBA_ROOT_PREFIX=/workspace/mamba
+
+Training seems stuck:
+  -> Heartbeat prints every 30s - if no output, check training.log
+  -> CPU training is slow (minutes per model), this is normal
+
+Authentication failed (git clone):
+  -> Use personal access token: git clone https://<TOKEN>@github.com/jratnieks/Hybridyzer.git
