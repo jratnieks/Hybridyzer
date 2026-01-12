@@ -1,7 +1,7 @@
 # Agent Context - Hybridyzer
 
 > Single source of truth for decisions, constraints, assumptions, and open questions.
-> Last updated: 2026-01-09
+> Last updated: 2026-01-10
 
 ---
 
@@ -148,6 +148,19 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 ### ~~P1: WSL RAPIDS Environment Setup (2026-01-09)~~ DONE
 - Confirmed `hybridyzer` conda env (RAPIDS 24.08, Python 3.10)
 - Ran GPU nightly: `results/nightly/20260109_060121` (no runs met drawdown constraint)
+
+### P2: GPU Pre-Transfer Optimization (2026-01-10)
+- **Problem**: Current walk-forward training converts pandas → cuDF 385 times (77 windows × 5 models), causing significant CPU→GPU transfer overhead (~30-40% of training time)
+- **Solution**: Pre-load full feature DataFrame to GPU once at start of walk-forward training, then slice cuDF DataFrames per window (no transfer needed)
+- **Expected speedup**: 2-3x faster training (from ~4-5 hours to ~1.5-2.5 hours per complete run)
+- **Implementation**:
+  - Pre-load `cached_features` to cuDF once in `combined_training()` after loading from parquet
+  - Modify `slice_window()` to support cuDF slicing (convert to pandas only at end for compatibility)
+  - Update `RegimeDetector.fit()`, `SignalBlender.fit()`, `DirectionBlender.fit()` to detect and use cuDF directly if provided
+- **Notes**:
+  - Apply any window-dependent ops (rolling stats, label smoothing, purge/embargo) after slicing to avoid leakage
+  - Track GPU memory pressure; fallback to chunked slicing if the full feature frame is too large
+- **Status**: Proposed, not yet implemented
 
 ## Critiques
 

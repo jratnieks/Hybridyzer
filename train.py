@@ -12,6 +12,7 @@ import json
 import os
 import random
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -417,7 +418,7 @@ from modules.trendmagic import TrendMagicV2
 from modules.pvt_eliminator import PVTEliminator
 from modules.pivots_rsi import PivotRSIContext
 from modules.linreg_channel import LinRegChannelContext
-from core.feature_store import FeatureStore
+from core.feature_store import FeatureStore, get_gpu_memory_info
 from core.regime_detector import RegimeDetector, wilder_atr
 from core.signal_blender import SignalBlender, DirectionBlender
 from core.labeling import make_direction_labels, make_regime_labels
@@ -595,6 +596,54 @@ def _apply_purge_and_embargo(
         adjusted.append((train_start, adj_train_end, adj_val_start, adj_val_end))
 
     return adjusted, purge_delta, embargo_delta
+
+
+def _check_gpu_memory_safe_for_preload(features: pd.DataFrame, use_gpu: bool, max_usage_ratio: float = 0.5) -> bool:
+    """
+    Check if GPU has enough memory to safely pre-load the full feature DataFrame.
+    
+    Args:
+        features: Feature DataFrame to estimate memory for
+        use_gpu: Whether GPU is requested
+        max_usage_ratio: Maximum fraction of GPU memory to use (default: 0.5 = 50%)
+        
+    Returns:
+        True if safe to pre-load, False otherwise
+    """
+    if not use_gpu:
+        return False
+    
+    try:
+        # Estimate memory needed (rough estimate: 8 bytes per float64 value)
+        num_rows = len(features)
+        num_cols = len(features.columns)
+        estimated_bytes = num_rows * num_cols * 8
+        estimated_mb = estimated_bytes / (1024 ** 2)
+        
+        # Get GPU memory info
+        gpu_info = get_gpu_memory_info()
+        if gpu_info is None:
+            print(f"[GPU] Cannot get GPU memory info, skipping pre-load (estimated: {estimated_mb:.0f}MB)")
+            return False
+        
+        # Use device_free_gb as available memory
+        available_gb = gpu_info.get('device_free_gb', 0)
+        if available_gb <= 0:
+            print(f"[GPU] No free GPU memory detected, skipping pre-load (estimated: {estimated_mb:.0f}MB)")
+            return False
+        
+        available_mb = available_gb * 1024
+        max_allowed_mb = available_mb * max_usage_ratio
+        
+        if estimated_mb > max_allowed_mb:
+            print(f"[GPU] Feature frame too large for pre-load: {estimated_mb:.0f}MB > {max_allowed_mb:.0f}MB (using {max_usage_ratio*100:.0f}% of {available_gb:.1f}GB free)")
+            return False
+        
+        print(f"[GPU] Memory check passed: {estimated_mb:.0f}MB < {max_allowed_mb:.0f}MB ({max_usage_ratio*100:.0f}% of {available_gb:.1f}GB free)")
+        return True
+    except Exception as e:
+        print(f"[GPU] Error checking GPU memory: {e}, skipping pre-load")
+        return False
 
 
 def train_one_window(
@@ -972,12 +1021,24 @@ def slice_window(
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Slice cached features and raw data for a time window, enforcing alignment.
+    Supports both pandas and cuDF DataFrames for features.
 
     Labels always derive from the raw df slice; models see the cached features
     on the exact same index. Any divergence is a correctness bug and must fail
     fast.
     """
-    feats_window = features[(features.index >= start_ts) & (features.index < end_ts)]
+    # Detect if features is cuDF
+    is_cudf = hasattr(features, '__class__') and 'cudf' in str(type(features))
+    
+    if is_cudf:
+        # Slice cuDF DataFrame
+        feats_window = features[(features.index >= start_ts) & (features.index < end_ts)]
+        # Convert to pandas for compatibility with rest of pipeline
+        feats_window = feats_window.to_pandas()
+    else:
+        # Slice pandas DataFrame (existing logic)
+        feats_window = features[(features.index >= start_ts) & (features.index < end_ts)].copy()
+    
     df_window = df.loc[feats_window.index]
 
     if not feats_window.index.equals(df_window.index):
@@ -1170,6 +1231,26 @@ def combined_training(
         exclude_features=exclude_features,
     )
 
+    # Pre-load features to GPU once if using GPU and memory check passes
+    cached_features_gpu = None
+    if use_gpu and _check_gpu_memory_safe_for_preload(cached_features, use_gpu=True):
+        try:
+            import cudf
+            print(f"[GPU] Pre-loading {len(cached_features)} rows to GPU memory...")
+            sys.stdout.flush()
+            cached_features_gpu = cudf.from_pandas(cached_features)
+            print(f"[GPU] Features loaded to GPU: {cached_features_gpu.shape}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"[GPU] Warning: Could not pre-load to GPU: {e}")
+            print(f"[GPU] Full traceback:\n{traceback.format_exc()}")
+            print(f"[GPU] Will convert per-window instead")
+            sys.stdout.flush()
+            cached_features_gpu = None
+    elif use_gpu:
+        print(f"[GPU] Skipping pre-load (memory check failed or GPU unavailable), will convert per-window")
+        sys.stdout.flush()
+
     # Generate splits
     splits = prepare_windows(
         df,
@@ -1185,6 +1266,7 @@ def combined_training(
     
     print(f"\nGenerated {len(splits)} walk-forward splits")
     print(f"Training window: {train_months} months, Validation window: {val_months} months, Slide: {slide_months} months\n")
+    sys.stdout.flush()
     
     # Store results
     all_results = []
@@ -1194,28 +1276,52 @@ def combined_training(
     best_direction_blender = None
     best_regime_models = {}
     
+    # Track timing for progress
+    start_time = time.time()
+    window_times = []
+    
     # Walk-forward training
     for i, (train_start, train_end, val_start, val_end) in enumerate(splits, 1):
+        window_start_time = time.time()
+        
+        # Progress bar
+        progress_pct = i / len(splits) * 100
+        bar_length = 40
+        filled = int(bar_length * i / len(splits))
+        bar = '=' * filled + '-' * (bar_length - filled)
+        elapsed = time.time() - start_time
+        avg_time_per_window = elapsed / i if i > 0 else 0
+        remaining_windows = len(splits) - i
+        eta_seconds = avg_time_per_window * remaining_windows
+        eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s" if eta_seconds > 0 else "calculating..."
+        
         print(f"\n{'='*60}")
-        print(f"Window {i}/{len(splits)}")
+        print(f"Window {i}/{len(splits)} [{progress_pct:.1f}%] |{bar}| ETA: {eta_str}")
         print(f"Train: {train_start.date()} to {train_end.date()}")
         print(f"Val:   {val_start.date()} to {val_end.date()}")
         print(f"{'='*60}")
+        sys.stdout.flush()
         
         # Extract windows using cached feature index to prevent any recomputation
+        # Use GPU features if available, otherwise fallback to pandas
         try:
-            df_train, feats_train = slice_window(df, cached_features, train_start, train_end)
-            df_val, feats_val = slice_window(df, cached_features, val_start, val_end)
-        except ValueError as e:
-            print(f"Warning: Skipping window {i} due to alignment error: {e}")
+            features_to_slice = cached_features_gpu if cached_features_gpu is not None else cached_features
+            df_train, feats_train = slice_window(df, features_to_slice, train_start, train_end)
+            df_val, feats_val = slice_window(df, features_to_slice, val_start, val_end)
+        except (ValueError, Exception) as e:
+            print(f"Warning: Skipping window {i} due to error: {e}")
+            print(f"Full traceback:\n{traceback.format_exc()}")
+            sys.stdout.flush()
             continue
 
         if len(df_train) == 0 or len(df_val) == 0:
             print(f"Warning: Skipping window {i} - insufficient data")
+            sys.stdout.flush()
             continue
 
         # Train on window using cached features to prevent repeated computation
         print("Training models...")
+        sys.stdout.flush()
         try:
             # Prepare validation data for calibration if needed
             X_val_window = None
@@ -1276,13 +1382,16 @@ def combined_training(
             )
             print(f"  Training samples: {train_stats['train_samples']}")
             print(f"  Features: {train_stats['feature_count']}")
+            sys.stdout.flush()
         except Exception as e:
             print(f"  Error during training: {e}")
             print(f"  Full traceback:\n{traceback.format_exc()}")
+            sys.stdout.flush()
             continue
 
         # Validate on window
         print("Validating models...")
+        sys.stdout.flush()
         try:
             val_metrics = validate_models_for_window(
                 df_val,
@@ -1312,9 +1421,17 @@ def combined_training(
                 best_direction_blender = direction_blender
                 best_regime_models = regime_models
                 print(f"  *** New best model (return: {best_val_return:.4f}) ***")
+            
+            # Window timing
+            window_time = time.time() - window_start_time
+            window_times.append(window_time)
+            avg_window_time = np.mean(window_times[-10:]) if len(window_times) > 0 else window_time  # Last 10 windows
+            print(f"  Window completed in {window_time:.1f}s (avg: {avg_window_time:.1f}s)")
+            sys.stdout.flush()
         except Exception as e:
             print(f"  Error during validation: {e}")
             print(f"  Full traceback:\n{traceback.format_exc()}")
+            sys.stdout.flush()
             continue
         
         # Store results
@@ -1328,6 +1445,13 @@ def combined_training(
             **val_metrics
         }
         all_results.append(result)
+        
+        # Periodic status update every 10 windows
+        if i % 10 == 0:
+            elapsed_total = time.time() - start_time
+            print(f"\n[Progress] Completed {i}/{len(splits)} windows in {elapsed_total/60:.1f} minutes")
+            print(f"[Progress] Best return so far: {best_val_return:.4f}")
+            sys.stdout.flush()
     
     # Summary
     print(f"\n{'='*60}")

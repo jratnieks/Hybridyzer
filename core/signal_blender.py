@@ -312,12 +312,20 @@ class SignalBlender(BlenderBase):
         # Store feature names
         self.feature_names = X_clean.columns.tolist()
         
-        # GPU: Convert to cuDF for training
+        # GPU: Convert to cuDF for training (or use if already cuDF)
         if self.use_gpu:
             cudf = self._cudf or self._require_cuml()[0]
             cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
-            print(f"[SignalBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
-            X_gpu = cudf.from_pandas(X_clean)
+            
+            # Check if already cuDF
+            is_cudf = hasattr(X_clean, '__class__') and 'cudf' in str(type(X_clean))
+            if is_cudf:
+                X_gpu = X_clean
+                print(f"[SignalBlender] Using pre-loaded GPU data: {len(X_gpu)} samples")
+            else:
+                print(f"[SignalBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
+                X_gpu = cudf.from_pandas(X_clean)
+            
             y_gpu = cudf.Series(y_numeric.values, dtype='int32')
 
             # Initialize and train model on GPU
@@ -748,12 +756,20 @@ class DirectionBlender(BlenderBase):
         # Store feature names
         self.feature_names = X_clean.columns.tolist()
         
-        # GPU: Convert to cuDF for training
+        # GPU: Convert to cuDF for training (or use if already cuDF)
         if self.use_gpu:
             cudf = self._cudf or self._require_cuml()[0]
             cuRFClassifier = self._cuRFClassifier or self._require_cuml()[1]
-            print(f"[DirectionBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
-            X_gpu = cudf.from_pandas(X_clean)
+            
+            # Check if already cuDF
+            is_cudf = hasattr(X_clean, '__class__') and 'cudf' in str(type(X_clean))
+            if is_cudf:
+                X_gpu = X_clean
+                print(f"[DirectionBlender] Using pre-loaded GPU data: {len(X_gpu)} samples")
+            else:
+                print(f"[DirectionBlender] Converting {len(X_clean)} samples to cuDF for GPU training...")
+                X_gpu = cudf.from_pandas(X_clean)
+            
             y_gpu = cudf.Series(y_numeric.values, dtype='int32')
 
             # Initialize and train model on GPU
