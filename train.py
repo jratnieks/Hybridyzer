@@ -1290,10 +1290,14 @@ def combined_training(
         filled = int(bar_length * i / len(splits))
         bar = '=' * filled + '-' * (bar_length - filled)
         elapsed = time.time() - start_time
-        avg_time_per_window = elapsed / i if i > 0 else 0
-        remaining_windows = len(splits) - i
-        eta_seconds = avg_time_per_window * remaining_windows
-        eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s" if eta_seconds > 0 else "calculating..."
+        # Only calculate ETA after first window completes
+        if i > 1 and len(window_times) > 0:
+            avg_time_per_window = np.mean(window_times) if len(window_times) > 0 else elapsed / i
+            remaining_windows = len(splits) - i
+            eta_seconds = avg_time_per_window * remaining_windows
+            eta_str = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+        else:
+            eta_str = "calculating..."
         
         print(f"\n{'='*60}")
         print(f"Window {i}/{len(splits)} [{progress_pct:.1f}%] |{bar}| ETA: {eta_str}")
@@ -1320,7 +1324,8 @@ def combined_training(
             continue
 
         # Train on window using cached features to prevent repeated computation
-        print("Training models...")
+        train_start_time = time.time()
+        print(f"Training models... (started at {datetime.now().strftime('%H:%M:%S')})")
         sys.stdout.flush()
         try:
             # Prepare validation data for calibration if needed
@@ -1380,8 +1385,10 @@ def combined_training(
                 y_val=y_val_window,
                 calibration_source=calibration_source,
             )
+            train_elapsed = time.time() - train_start_time
             print(f"  Training samples: {train_stats['train_samples']}")
             print(f"  Features: {train_stats['feature_count']}")
+            print(f"  Training completed in {train_elapsed:.1f}s")
             sys.stdout.flush()
         except Exception as e:
             print(f"  Error during training: {e}")
@@ -1390,7 +1397,8 @@ def combined_training(
             continue
 
         # Validate on window
-        print("Validating models...")
+        val_start_time = time.time()
+        print(f"Validating models... (started at {datetime.now().strftime('%H:%M:%S')})")
         sys.stdout.flush()
         try:
             val_metrics = validate_models_for_window(
@@ -1426,6 +1434,8 @@ def combined_training(
             window_time = time.time() - window_start_time
             window_times.append(window_time)
             avg_window_time = np.mean(window_times[-10:]) if len(window_times) > 0 else window_time  # Last 10 windows
+            val_elapsed = time.time() - val_start_time
+            print(f"  Validation completed in {val_elapsed:.1f}s")
             print(f"  Window completed in {window_time:.1f}s (avg: {avg_window_time:.1f}s)")
             sys.stdout.flush()
         except Exception as e:

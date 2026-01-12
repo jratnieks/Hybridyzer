@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 import pickle
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -335,7 +336,10 @@ class SignalBlender(BlenderBase):
             print(f"[SignalBlender] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
             from sklearn.ensemble import GradientBoostingClassifier
-            print("[CPU] sklearn backend active for SignalBlender")
+            import time
+            print(f"[SignalBlender] CPU training starting: {len(X_clean)} samples, {len(self.feature_names)} features...")
+            sys.stdout.flush()
+            fit_start = time.time()
             self.model = GradientBoostingClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -343,7 +347,9 @@ class SignalBlender(BlenderBase):
                 random_state=self.model_params.get('random_state', 42)
             )
             self.model.fit(X_clean, y_numeric)
-            print(f"[SignalBlender] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
+            fit_time = time.time() - fit_start
+            print(f"[SignalBlender] CPU training complete in {fit_time:.1f}s: {len(X_clean)} samples, {len(self.feature_names)} features")
+            sys.stdout.flush()
         
         # Store feature importances from trained model
         self._store_feature_importances()
@@ -779,7 +785,10 @@ class DirectionBlender(BlenderBase):
             print(f"[DirectionBlender] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
             from sklearn.ensemble import GradientBoostingClassifier
-            print("[CPU] sklearn backend active for DirectionBlender")
+            import time
+            print(f"[DirectionBlender] CPU training starting: {len(X_clean)} samples, {len(self.feature_names)} features...")
+            sys.stdout.flush()
+            fit_start = time.time()
             self.model = GradientBoostingClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -787,7 +796,9 @@ class DirectionBlender(BlenderBase):
                 random_state=self.model_params.get('random_state', 42)
             )
             self.model.fit(X_clean, y_numeric)
-            print(f"[DirectionBlender] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
+            fit_time = time.time() - fit_start
+            print(f"[DirectionBlender] CPU training complete in {fit_time:.1f}s: {len(X_clean)} samples, {len(self.feature_names)} features")
+            sys.stdout.flush()
         
         # Store feature importances from trained model
         self._store_feature_importances()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 import pickle
+import sys
 from pathlib import Path
 from typing import Literal, Optional, Tuple
 
@@ -134,7 +135,10 @@ class RegimeDetector:
             print(f"[RegimeDetector] GPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
         else:
             from sklearn.ensemble import RandomForestClassifier
-            print("[CPU] sklearn backend active")
+            import time
+            print(f"[RegimeDetector] CPU training starting: {len(X_clean)} samples, {len(self.feature_names)} features...")
+            sys.stdout.flush()
+            fit_start = time.time()
             self.model = RandomForestClassifier(
                 n_estimators=self.model_params.get('n_estimators', 100),
                 max_depth=self.model_params.get('max_depth', 16),
@@ -142,7 +146,9 @@ class RegimeDetector:
                 n_jobs=-1
             )
             self.model.fit(X_clean, y_numeric)
-            print(f"[RegimeDetector] CPU training complete: {len(X_clean)} samples, {len(self.feature_names)} features")
+            fit_time = time.time() - fit_start
+            print(f"[RegimeDetector] CPU training complete in {fit_time:.1f}s: {len(X_clean)} samples, {len(self.feature_names)} features")
+            sys.stdout.flush()
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
         """
