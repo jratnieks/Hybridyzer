@@ -35,22 +35,20 @@ python train.py --walkforward --gpu
 RUNPOD
 ================================================================================
 
-FIRST TIME SETUP:
------------------
+FIRST TIME SETUP (automated):
+-----------------------------
 cd /workspace
 git clone https://github.com/jratnieks/Hybridyzer.git
 cd Hybridyzer
+bash setup_runpod.sh
 
-# Option A: Pip (quick, simpler)
+# Upload data (run from LOCAL machine, not RunPod)
+scp -P <PORT> -i ~/.ssh/id_ed25519 data/*.csv root@<IP>:/workspace/Hybridyzer/data/
+
+MANUAL SETUP (if script fails):
+-------------------------------
+cd /workspace/Hybridyzer
 pip install -r requirements_runpod.txt --extra-index-url=https://pypi.nvidia.com
-
-# Option B: Conda (more reliable for RAPIDS)
-export MAMBA_ROOT_PREFIX=/workspace/mamba
-micromamba env create -f environment.runpod.yml -y
-micromamba activate hybridyzer
-
-# Upload data
-scp -P <PORT> -i ~/.ssh/id_ed25519 data/*.parquet root@<IP>:/workspace/Hybridyzer/data/
 
 EVERY TIME (new session):
 -------------------------
