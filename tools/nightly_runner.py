@@ -286,6 +286,8 @@ def _build_train_command(args: argparse.Namespace, cfg: Dict[str, object], train
         cmd.extend(["--calibration-source", args.calibration_source])
     if args.cpu_only:
         cmd.append("--cpu-only")
+    if args.runpod:
+        cmd.append("--runpod")
     if args.use_full_pipeline:
         cmd.append("--use-full-pipeline")
     if args.embargo_days:
@@ -428,6 +430,8 @@ def main() -> None:
                         help="Force CPU backend")
     parser.add_argument("--auto-cpu-fallback", action="store_true",
                         help="Retry once on CPU if GPU run fails")
+    parser.add_argument("--runpod", action="store_true",
+                        help="Use RunPod paths (/workspace/Hybridyzer)")
     parser.add_argument("--use-full-pipeline", action="store_true",
                         help="Use full training pipeline with feature pruning/diagnostics")
     parser.add_argument("--embargo-days", type=int, default=0,
