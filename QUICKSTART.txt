@@ -76,13 +76,13 @@ TRAINING COMMANDS:
 python train.py --runpod --walkforward
 
 # Nightly runner (8 hours, Thompson sampling)
-python tools/nightly_runner.py --time-budget-hours 8 --promote-best --bandit-thompson
+python tools/nightly_runner.py --runpod --time-budget-hours 8 --promote-best --bandit-thompson
 
 # Longer run (24 hours overnight)
-python tools/nightly_runner.py --time-budget-hours 24 --promote-best --bandit-thompson
+python tools/nightly_runner.py --runpod --time-budget-hours 24 --promote-best --bandit-thompson
 
 # Background run (keeps running after disconnect)
-nohup python tools/nightly_runner.py --time-budget-hours 24 --promote-best --bandit-thompson > training.log 2>&1 &
+nohup python tools/nightly_runner.py --runpod --time-budget-hours 24 --promote-best --bandit-thompson > training.log 2>&1 &
 
 # Monitor background run
 tail -f training.log
