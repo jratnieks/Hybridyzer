@@ -35,28 +35,40 @@ python train.py --walkforward --gpu
 RUNPOD
 ================================================================================
 
-FIRST TIME SETUP (automated):
------------------------------
+FIRST TIME SETUP (one command from Windows):
+--------------------------------------------
+.\upload_to_runpod.ps1
+
+  1. Paste SSH command from RunPod "Connect" button
+  2. Script uploads data + runs setup automatically
+  3. Done! SSH in and start training
+
+ALTERNATIVE OPTIONS:
+--------------------
+# Just upload data (setup manually)
+.\upload_to_runpod.ps1
+# answer "n" when asked about setup
+
+# Just run setup (data already uploaded)
+.\upload_to_runpod.ps1 -SkipUpload -Setup
+
+# Force both upload + setup (no prompts)
+.\upload_to_runpod.ps1 -Setup
+
+MANUAL SETUP (from RunPod terminal):
+------------------------------------
 cd /workspace
 git clone https://github.com/jratnieks/Hybridyzer.git
 cd Hybridyzer
 bash setup_runpod.sh
 
-# Upload data (run from LOCAL machine, not RunPod)
+# Then upload data from local Windows:
 scp -P <PORT> -i ~/.ssh/id_ed25519 data/*.csv root@<IP>:/workspace/Hybridyzer/data/
-
-MANUAL SETUP (if script fails):
--------------------------------
-cd /workspace/Hybridyzer
-pip install -r requirements_runpod.txt --extra-index-url=https://pypi.nvidia.com
 
 EVERY TIME (new session):
 -------------------------
 cd /workspace/Hybridyzer
 git pull origin master
-
-# If using conda:
-micromamba activate hybridyzer
 
 TRAINING COMMANDS:
 ------------------
