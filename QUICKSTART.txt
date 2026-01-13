@@ -28,7 +28,7 @@ python tools/nightly_runner.py --time-budget-hours 8 --promote-best --bandit-tho
 python tools/nightly_runner.py --time-budget-hours 2 --bandit-thompson
 
 # Force GPU (if RAPIDS installed)
-python train.py --walkforward --gpu
+python train.py --walkforward  # GPU auto-detected if RAPIDS installed
 
 
 ================================================================================
@@ -73,7 +73,7 @@ git pull origin master
 TRAINING COMMANDS:
 ------------------
 # Single walk-forward run with GPU
-python train.py --runpod --walkforward --gpu
+python train.py --runpod --walkforward
 
 # Nightly runner (8 hours, Thompson sampling)
 python tools/nightly_runner.py --time-budget-hours 8 --promote-best --bandit-thompson

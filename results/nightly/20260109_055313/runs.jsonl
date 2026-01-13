@@ -1,0 +1,10 @@
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 8}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_001", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 12}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_002", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 24, "smoothing_window": 8}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_003", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 24, "smoothing_window": 12}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_004", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 8, "disable_ml_features": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_005", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 8, "disable_regime_context": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_006", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 8, "disable_signal_dynamics": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_007", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 8, "disable_rolling_stats": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_008", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 12, "disable_ml_features": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_009", "bandit": null}
+{"status": "failed:1", "config": {"horizon_bars": 12, "smoothing_window": 12, "disable_regime_context": true}, "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_055313/run_010", "bandit": null}

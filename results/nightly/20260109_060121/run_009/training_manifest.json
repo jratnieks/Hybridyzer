@@ -1,0 +1,65 @@
+{
+  "ablation": {
+    "disable_ml_features": true,
+    "disable_modules": null,
+    "disable_regime_context": false,
+    "disable_rolling_stats": false,
+    "disable_signal_dynamics": false,
+    "exclude_features": null,
+    "include_features": null,
+    "include_modules": null
+  },
+  "blend_feature_columns_path": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/blend_feature_columns.txt",
+  "calibration": {
+    "disabled": false,
+    "method": "isotonic",
+    "sharpening_alpha": 2.0,
+    "source": "train"
+  },
+  "data_path": "btcusd_5min_train_2017_2022.csv + btcusd_5min_val_2023.csv",
+  "evaluation": {
+    "eval_mode": "nonoverlap",
+    "transaction_cost_bps": 1.0
+  },
+  "feature_cache_path": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/cached_features.parquet",
+  "feature_columns_path": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/feature_columns.txt",
+  "label_config": {
+    "horizon_bars": 12,
+    "label_threshold": 0.0005,
+    "smoothing_window": 12
+  },
+  "log_path": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_060121/run_009/train.log",
+  "model_paths": {
+    "direction_blender": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/blender_direction_model.pkl",
+    "regime_model": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/regime_model.pkl",
+    "regime_specific_signal": [],
+    "signal_blender": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/blender_model.pkl"
+  },
+  "modules": {
+    "context_modules": [
+      "pivots_rsi",
+      "linreg",
+      "ohlcv"
+    ],
+    "signal_modules": [
+      "superma",
+      "trendmagic",
+      "pvt"
+    ]
+  },
+  "regime_label_strategy": "indicator",
+  "results_paths": {
+    "training_results": "/mnt/c/Users/joshr/Projects/Hybridyzer/models/training_results.csv"
+  },
+  "run_type": "walkforward",
+  "seed": 42,
+  "timestamp": "2026-01-09T07:24:46.206940Z",
+  "use_gpu": true,
+  "walkforward": {
+    "embargo_days": 0,
+    "purge_bars": 0,
+    "slide_months": 1,
+    "train_months": 6,
+    "val_months": 1
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "disable_signal_dynamics": true,
+  "horizon_bars": 12,
+  "smoothing_window": 8
+}

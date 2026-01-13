@@ -163,7 +163,7 @@ if ($Setup) {
     Write-Host "Ready to train! SSH in and run:" -ForegroundColor Green
     Write-Host "  $SshCommand"
     Write-Host "  cd /workspace/Hybridyzer"
-    Write-Host "  python train.py --runpod --walkforward --gpu"
+    Write-Host "  python train.py --runpod --walkforward"
     Write-Host ""
 } else {
     Write-Host ""
@@ -171,6 +171,6 @@ if ($Setup) {
     Write-Host "  $SshCommand"
     Write-Host "  cd /workspace/Hybridyzer"
     Write-Host "  bash setup_runpod.sh  # if first time"
-    Write-Host "  python train.py --runpod --walkforward --gpu"
+    Write-Host "  python train.py --runpod --walkforward"
     Write-Host ""
 }

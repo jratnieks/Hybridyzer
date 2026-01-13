@@ -1,0 +1,50 @@
+{
+  "confusion_matrices": {
+    "direction": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/confusion_direction.csv",
+    "regime": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/confusion_regime.csv",
+    "signal": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/confusion_signal.csv"
+  },
+  "direction_accuracy": 0.5714285714285714,
+  "direction_return_metrics": {
+    "avg_trade_return": 0.0008331859727331828,
+    "cumulative_return": 5.662349806824575,
+    "fee_bps": 1.0,
+    "gross_avg_trade_return": 0.0008921846779554529,
+    "gross_cumulative_return": 6.6367033095194925,
+    "gross_mean_return": 0.0008921846779554529,
+    "gross_sharpe_like": 0.16560815567430615,
+    "gross_volatility": 0.005387323313412602,
+    "gross_win_rate": 0.569270608545533,
+    "mean_return": 0.0008331859727331828,
+    "samples": 2317,
+    "sharpe_like": 0.15486932296512482,
+    "total_cost": 0.1367,
+    "trade_count": 2317,
+    "trade_rate": 1.0,
+    "volatility": 0.005379929070399622,
+    "win_rate": 0.5623651273198101
+  },
+  "regime_accuracy": 0.5629074315514994,
+  "signal_accuracy": 0.33116036505867014,
+  "signal_confidence_filtered_pct": 0.7291395045632334,
+  "signal_confidence_threshold": 0.6,
+  "signal_return_metrics": {
+    "avg_trade_return": 0.0012339974807304087,
+    "cumulative_return": 1.6234214832961529,
+    "fee_bps": 1.0,
+    "gross_avg_trade_return": 0.0012888518496624475,
+    "gross_cumulative_return": 1.8539281501269271,
+    "gross_mean_return": 0.00034615838465510324,
+    "gross_sharpe_like": 0.11770904502663103,
+    "gross_volatility": 0.002940796814525059,
+    "gross_win_rate": 0.5995145631067961,
+    "mean_return": 0.0003186812008219872,
+    "samples": 3068,
+    "sharpe_like": 0.10859779425171798,
+    "total_cost": 0.08430000000000001,
+    "trade_count": 824,
+    "trade_rate": 0.2685788787483703,
+    "volatility": 0.002934508965102169,
+    "win_rate": 0.595873786407767
+  }
+}

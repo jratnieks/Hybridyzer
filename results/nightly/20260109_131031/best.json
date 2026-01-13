@@ -1,0 +1,19 @@
+{
+  "bandit": null,
+  "config": {
+    "horizon_bars": 12,
+    "smoothing_window": 12
+  },
+  "drawdown_ok": true,
+  "metrics": {
+    "avg_return": 0.04726343803524333,
+    "median_return": 0.0197434057286183,
+    "trimmed_mean_return": 0.0437279301156539,
+    "windows": 77.0,
+    "worst_drawdown": -0.4296186643759166
+  },
+  "reward": 0.0437279301156539,
+  "run_dir": "/mnt/c/Users/joshr/Projects/Hybridyzer/results/nightly/20260109_131031/run_002",
+  "score": 0.0437279301156539,
+  "status": "ok"
+}
