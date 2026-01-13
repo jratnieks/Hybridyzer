@@ -1111,8 +1111,12 @@ def slice_window(
     is_cudf = hasattr(features, '__class__') and 'cudf' in str(type(features))
     
     if is_cudf:
-        # Slice cuDF DataFrame
-        feats_window = features[(features.index >= start_ts) & (features.index < end_ts)]
+        # cuDF doesn't support timezone-aware comparisons - strip timezone
+        start_naive = start_ts.tz_localize(None) if start_ts.tzinfo else start_ts
+        end_naive = end_ts.tz_localize(None) if end_ts.tzinfo else end_ts
+        
+        # Slice cuDF DataFrame with timezone-naive timestamps
+        feats_window = features[(features.index >= start_naive) & (features.index < end_naive)]
         # Convert to pandas for compatibility with rest of pipeline
         feats_window = feats_window.to_pandas()
     else:
