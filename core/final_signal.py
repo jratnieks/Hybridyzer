@@ -114,7 +114,7 @@ class FinalSignalGenerator:
         p_long: Optional[float] = None,
         p_short: Optional[float] = None,
         require_blender_agreement: bool = False,
-        allow_low_confidence: bool = True,
+        allow_low_confidence: bool = False,
         use_gpu: bool = True,
         regime_detector: Optional[RegimeDetector] = None,
         signal_blender: Optional[SignalBlender] = None,
@@ -132,7 +132,7 @@ class FinalSignalGenerator:
         Args:
             probability_threshold: Minimum probability for DirectionBlender to take a trade (default: 0.60)
             require_blender_agreement: If True, require 3-class SignalBlender to agree with DirectionBlender (default: False)
-            allow_low_confidence: If True, allow trades with proba >= 0.25 even if below main threshold (default: True)
+            allow_low_confidence: If True, allow trades with proba >= 0.25 even if below main threshold (default: False)
             use_gpu: Whether to use GPU acceleration (default: True)
             regime_detector: Optional pre-loaded RegimeDetector instance
             signal_blender: Optional pre-loaded SignalBlender instance
@@ -167,8 +167,8 @@ class FinalSignalGenerator:
         
         # Regime/side policy: defines which trades are allowed per regime
         default_regime_side_policy = {
-            'trend_up':   {'long': True,  'short': True},
-            'trend_down': {'long': False, 'short': False},
+            'trend_up':   {'long': True,  'short': False},
+            'trend_down': {'long': False, 'short': True},
             'chop':       {'long': False, 'short': False},
         }
         self.regime_side_policy = regime_side_policy or default_regime_side_policy
@@ -176,7 +176,7 @@ class FinalSignalGenerator:
         # Disable regime toggle: completely suppress entire regimes
         default_disable_regime = {
             'trend_up': False,
-            'trend_down': True,
+            'trend_down': False,
             'chop': True,
         }
         self.disable_regime = disable_regime if disable_regime is not None else default_disable_regime

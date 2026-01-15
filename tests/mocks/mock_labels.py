@@ -89,6 +89,9 @@ def make_direction_labels_mock(
         - blend_label: Direction label (-1, 0, 1)
         - future_return: Simulated future return (optional)
         - smoothed_return: Smoothed return series (optional)
+        - threshold: Base label threshold
+        - effective_threshold: Cost-adjusted threshold
+        - round_trip_cost: Round-trip cost used for labeling
         
     Note:
         This mock does NOT look at future data - it generates
@@ -106,6 +109,9 @@ def make_direction_labels_mock(
     blend_label = np.random.choice([-1, 0, 1], size=n_rows, p=[0.25, 0.50, 0.25])
     
     result = pd.DataFrame({'blend_label': blend_label}, index=timestamps)
+    result['threshold'] = 0.0005
+    result['effective_threshold'] = 0.0005
+    result['round_trip_cost'] = 0.0
     
     if include_returns:
         # Generate synthetic returns that roughly align with labels

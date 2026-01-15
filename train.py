@@ -735,6 +735,11 @@ def train_one_window(
     label_threshold: float = 0.0005,
     regime_label_strategy: str = "indicator",
     smoothing_window: int = 12,
+    transaction_cost_bps: float = 0.0,
+    cost_adjusted_labels: bool = False,
+    regime_model_params: Optional[dict] = None,
+    blender_model_params: Optional[dict] = None,
+    direction_model_params: Optional[dict] = None,
     use_gpu: bool = False,
     random_state: Optional[int] = None,
     calibration_method: Optional[str] = None,
@@ -756,6 +761,11 @@ def train_one_window(
         label_threshold: Threshold for direction labels
         regime_label_strategy: Regime label strategy ("indicator" or "rule")
         smoothing_window: Smoothing window for direction labels
+        transaction_cost_bps: Cost per side in basis points
+        cost_adjusted_labels: Whether to add round-trip costs to the label threshold
+        regime_model_params: Optional model params for RegimeDetector
+        blender_model_params: Optional model params for SignalBlender
+        direction_model_params: Optional model params for DirectionBlender
         use_gpu: Whether to use GPU acceleration for models
         random_state: Random seed for model initialization
         calibration_method: Calibration method for SignalBlender
@@ -771,6 +781,11 @@ def train_one_window(
     # Enforce index integrity between raw data and cached features to avoid
     # silent misalignment after cleaning/warmups.
     assert feats_train.index.equals(df_train.index), "Feature/price index mismatch in training window"
+    if direction_model_params is None:
+        direction_model_params = blender_model_params
+    regime_params = regime_model_params.copy() if regime_model_params is not None else None
+    blender_params = blender_model_params.copy() if blender_model_params is not None else None
+    direction_params = direction_model_params.copy() if direction_model_params is not None else None
 
     # Generate labels
     regime_y = build_regime_labels(df_train, feats_train, regime_label_strategy)
@@ -780,6 +795,8 @@ def train_one_window(
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
         smoothing_window=smoothing_window,
+        cost_bps_per_side=transaction_cost_bps,
+        cost_adjusted=cost_adjusted_labels,
         debug=False  # Suppress debug output in walk-forward windows
     )
     blend_y = df_labeled['blend_label'].reindex(feats_train.index).fillna(0).astype(int)
@@ -809,7 +826,7 @@ def train_one_window(
     }).fillna(2)  # Default to chop if unknown
     
     # Train models
-    reg = RegimeDetector(use_gpu=use_gpu, random_state=random_state)
+    reg = RegimeDetector(model_params=regime_params, use_gpu=use_gpu, random_state=random_state)
     reg.fit(X_regime, regime_y)
     
     # Determine calibration data based on calibration_source
@@ -821,7 +838,7 @@ def train_one_window(
         y_cal = y_val
     # Otherwise, calibration will use train data (default behavior in SignalBlender.fit)
     
-    blender = SignalBlender(use_gpu=use_gpu, random_state=random_state)
+    blender = SignalBlender(model_params=blender_params, use_gpu=use_gpu, random_state=random_state)
     blender.fit(
         X_blend,
         blend_y,
@@ -861,7 +878,7 @@ def train_one_window(
                     name='direction'
                 )
         
-        direction_blender = DirectionBlender(use_gpu=use_gpu, random_state=random_state)
+        direction_blender = DirectionBlender(model_params=direction_params, use_gpu=use_gpu, random_state=random_state)
         direction_blender.fit(
             X_blend_trade,
             y_direction,
@@ -895,16 +912,19 @@ def train_one_window(
                 X_cal_regime = X_val[mask_val_regime]
                 y_cal_regime = y_val[mask_val_regime]
         
-        model_params = {
-            'n_estimators': 300,
-            'max_depth': 10,
-            'n_bins': 128,
-            'split_criterion': 0,
-            'bootstrap': True,
-            'max_samples': 0.8,
-            'max_features': 0.9,
-            'n_streams': 4
-        }
+        if blender_model_params is None:
+            model_params = {
+                'n_estimators': 300,
+                'max_depth': 10,
+                'n_bins': 128,
+                'split_criterion': 0,
+                'bootstrap': True,
+                'max_samples': 0.8,
+                'max_features': 0.9,
+                'n_streams': 4
+            }
+        else:
+            model_params = blender_model_params.copy()
         model_r = SignalBlender(model_params=model_params, use_gpu=use_gpu, random_state=random_state)
         model_r.fit(
             X_blend_regime,
@@ -940,7 +960,8 @@ def validate_one_window(
     regime_label_strategy: str = "indicator",
     smoothing_window: int = 12,
     eval_mode: str = "nonoverlap",
-    transaction_cost_bps: float = 0.0
+    transaction_cost_bps: float = 0.0,
+    cost_adjusted_labels: bool = False
 ) -> Dict:
     """
     Validate models on a validation window.
@@ -957,6 +978,7 @@ def validate_one_window(
         smoothing_window: Smoothing window for direction labels
         eval_mode: Return evaluation mode ("nonoverlap" or "per-bar")
         transaction_cost_bps: Cost per side in basis points
+        cost_adjusted_labels: Whether to add round-trip costs to the label threshold
         
     Returns:
         Dictionary with validation metrics
@@ -972,6 +994,8 @@ def validate_one_window(
         horizon_bars=horizon_bars,
         label_threshold=label_threshold,
         smoothing_window=smoothing_window,
+        cost_bps_per_side=transaction_cost_bps,
+        cost_adjusted=cost_adjusted_labels,
         debug=False  # Suppress debug output in walk-forward windows
     )
     blend_y_true = df_labeled['blend_label'].reindex(feats_val.index).fillna(0).astype(int)
@@ -1165,6 +1189,11 @@ def train_models_for_window(
     label_threshold: float,
     regime_label_strategy: str,
     smoothing_window: int,
+    transaction_cost_bps: float,
+    cost_adjusted_labels: bool,
+    regime_model_params: Optional[dict],
+    blender_model_params: Optional[dict],
+    direction_model_params: Optional[dict],
     use_gpu: bool,
     random_state: Optional[int],
     calibration_method: Optional[str],
@@ -1184,6 +1213,11 @@ def train_models_for_window(
         label_threshold=label_threshold,
         regime_label_strategy=regime_label_strategy,
         smoothing_window=smoothing_window,
+        transaction_cost_bps=transaction_cost_bps,
+        cost_adjusted_labels=cost_adjusted_labels,
+        regime_model_params=regime_model_params,
+        blender_model_params=blender_model_params,
+        direction_model_params=direction_model_params,
         use_gpu=use_gpu,
         random_state=random_state,
         calibration_method=calibration_method,
@@ -1208,6 +1242,7 @@ def validate_models_for_window(
     smoothing_window: int,
     eval_mode: str,
     transaction_cost_bps: float,
+    cost_adjusted_labels: bool,
 ) -> Dict:
     """Thin wrapper to make the validation stage signature explicit."""
     return validate_one_window(
@@ -1223,6 +1258,7 @@ def validate_models_for_window(
         smoothing_window=smoothing_window,
         eval_mode=eval_mode,
         transaction_cost_bps=transaction_cost_bps,
+        cost_adjusted_labels=cost_adjusted_labels,
     )
 
 
@@ -1251,6 +1287,10 @@ def combined_training(
     calibration_source: str = "train",
     eval_mode: str = "nonoverlap",
     transaction_cost_bps: float = 0.0,
+    cost_adjusted_labels: bool = False,
+    regime_model_params: Optional[dict] = None,
+    blender_model_params: Optional[dict] = None,
+    direction_model_params: Optional[dict] = None,
     # Ablation flags
     disable_ml_features: bool = False,
     disable_regime_context: bool = False,
@@ -1289,6 +1329,10 @@ def combined_training(
         calibration_source: Source of calibration data ('train' or 'val', default: 'train')
         eval_mode: Return evaluation mode ("nonoverlap" or "per-bar")
         transaction_cost_bps: Cost per side in basis points
+        cost_adjusted_labels: Whether to add round-trip costs to the label threshold
+        regime_model_params: Optional model params for RegimeDetector
+        blender_model_params: Optional model params for SignalBlender
+        direction_model_params: Optional model params for DirectionBlender
         include_modules: Optional list of module names to keep
         include_features: Optional list of regex patterns to include
         exclude_features: Optional list of regex patterns to exclude
@@ -1314,6 +1358,15 @@ def combined_training(
         include_features=include_features,
         exclude_features=exclude_features,
     )
+
+    if use_gpu and isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        # cuDF does not support timezone-aware indexes; keep UTC semantics but drop tz.
+        df = df.copy()
+        df.index = df.index.tz_convert(None)
+        cached_features = cached_features.copy()
+        cached_features.index = cached_features.index.tz_convert(None)
+        print("[GPU] Converted timezone-aware index to tz-naive for cuDF slicing")
+        sys.stdout.flush()
 
     # Pre-load features to GPU once if using GPU and memory check passes
     cached_features_gpu = None
@@ -1429,6 +1482,8 @@ def combined_training(
                     horizon_bars=horizon_bars,
                     label_threshold=label_threshold,
                     smoothing_window=smoothing_window,
+                    cost_bps_per_side=transaction_cost_bps,
+                    cost_adjusted=cost_adjusted_labels,
                     debug=False
                 )
                 blend_y_val = df_labeled_val['blend_label'].reindex(feats_val.index).fillna(0).astype(int)
@@ -1466,6 +1521,11 @@ def combined_training(
                 label_threshold,
                 regime_label_strategy,
                 smoothing_window,
+                transaction_cost_bps,
+                cost_adjusted_labels,
+                regime_model_params,
+                blender_model_params,
+                direction_model_params,
                 use_gpu,
                 random_state,
                 calibration_method,
@@ -1505,6 +1565,7 @@ def combined_training(
                 smoothing_window,
                 eval_mode,
                 transaction_cost_bps,
+                cost_adjusted_labels,
             )
             print(f"  Validation samples: {val_metrics['val_samples']}")
             print(f"  Regime accuracy: {val_metrics['regime_accuracy']:.4f}")
@@ -1606,6 +1667,11 @@ def combined_training(
                 label_threshold,
                 regime_label_strategy,
                 smoothing_window,
+                transaction_cost_bps,
+                cost_adjusted_labels,
+                regime_model_params,
+                blender_model_params,
+                direction_model_params,
                 use_gpu,
                 random_state,
                 calibration_method,
@@ -1671,6 +1737,7 @@ def train_full_pipeline(
     results_dir: Path = Path("results"),
     use_gpu: bool = False,
     random_state: int = 42,
+    model_params: Optional[dict] = None,
 ) -> Tuple:
     """
     Full training pipeline with feature pruning, importance analysis, and diagnostics.
@@ -1688,6 +1755,7 @@ def train_full_pipeline(
         models_dir: Directory to save models
         results_dir: Directory to save results
         random_state: Random seed for internal splits
+        model_params: Optional model parameters for the blender model
         
     Returns:
         Tuple of (trained_model, diagnostics_dict)
@@ -1728,7 +1796,7 @@ def train_full_pipeline(
     
     # 2. Initial training
     print(f"\n[2/7] Initial training...")
-    model = model_class(use_gpu=use_gpu, random_state=random_state)
+    model = model_class(model_params=model_params, use_gpu=use_gpu, random_state=random_state)
     model.fit(
         X_train, y_train,
         calibration_method=calibration_method,
@@ -1918,10 +1986,18 @@ def main():
                         help='Threshold for direction labels (default: 0.0005 = 0.05%%)')
     parser.add_argument('--min-trade-proba', type=float, default=0.0,
                         help='Minimum SignalBlender max proba to take a trade; below -> flat (default: 0.0)')
-    parser.add_argument('--fee-bps', type=float, default=1.0,
-                        help='Transaction cost per side in bps; use 0 to disable (default: 1.0)')
+    parser.add_argument('--taker-fee-bps', type=float, default=4.5,
+                        help='Taker fee per side in bps (default: 4.5, Hyperliquid perps base-tier)')
+    parser.add_argument('--slippage-bps', type=float, default=1.0,
+                        help='Slippage per side in bps (default: 1.0)')
+    parser.add_argument('--fee-bps', type=float, default=None,
+                        help='Deprecated: total per-side cost in bps (overrides taker fee, sets slippage to 0)')
     parser.add_argument('--eval-mode', type=str, default='nonoverlap', choices=['nonoverlap', 'per-bar'],
                         help='Return evaluation mode: nonoverlap or per-bar (default: nonoverlap)')
+    parser.add_argument('--no-cost-adjusted-labels', action='store_true',
+                        help='Disable cost-adjusted direction labels (default: enabled)')
+    parser.add_argument('--deep-train', action='store_true',
+                        help='Use deeper model parameters for regime/blender models')
     
     # Feature ablation flags (for A/B testing feature groups)
     parser.add_argument('--disable-ml-features', action='store_true',
@@ -2022,10 +2098,49 @@ def main():
         sharpening_alpha = args.alpha if args.alpha is not None else 2.0
         sharpening_alpha = max(1.0, min(3.0, sharpening_alpha))  # Clamp to [1.0, 3.0]
     
+    taker_fee_bps = args.taker_fee_bps
+    slippage_bps = args.slippage_bps
+    if args.fee_bps is not None:
+        print("[WARN] --fee-bps is deprecated; use --taker-fee-bps and --slippage-bps.")
+        taker_fee_bps = args.fee_bps
+        slippage_bps = 0.0
+    transaction_cost_bps = taker_fee_bps + slippage_bps
+    cost_adjusted_labels = not args.no_cost_adjusted_labels
+
+    regime_model_params = None
+    blender_model_params = None
+    direction_model_params = None
+    if args.deep_train:
+        regime_model_params = {
+            'n_estimators': 400,
+            'max_depth': 20,
+            'n_bins': 128,
+            'split_criterion': 0,
+            'bootstrap': True,
+            'max_samples': 0.8,
+            'max_features': 0.9,
+            'n_streams': 4
+        }
+        blender_model_params = {
+            'n_estimators': 600,
+            'max_depth': 22,
+            'max_features': 0.6,
+            'max_samples': 0.6,
+            'n_bins': 128,
+            'split_criterion': 0,
+            'bootstrap': True,
+            'n_streams': 1
+        }
+        direction_model_params = blender_model_params.copy()
+
     print(f"\nCalibration settings:")
     print(f"  Method: {calibration_method if calibration_method else 'DISABLED'}")
     print(f"  Sharpening alpha: {sharpening_alpha}")
-    print(f"[Evaluation] Mode: {args.eval_mode}, Fee bps: {args.fee_bps:.2f}")
+    print(f"[Evaluation] Mode: {args.eval_mode}, Cost per side (bps): {transaction_cost_bps:.2f}")
+    print(f"[Fees] Taker: {taker_fee_bps:.2f} bps, Slippage: {slippage_bps:.2f} bps")
+    print(f"[Labels] Cost-adjusted: {cost_adjusted_labels}")
+    if args.deep_train:
+        print(f"[Model] Deep training enabled")
 
     purge_bars = args.horizon_bars if args.purge_horizon else args.purge_bars
     
@@ -2229,7 +2344,11 @@ def main():
             disable_calibration=args.disable_calibration,
             calibration_source=args.calibration_source,
             eval_mode=args.eval_mode,
-            transaction_cost_bps=args.fee_bps,
+            transaction_cost_bps=transaction_cost_bps,
+            cost_adjusted_labels=cost_adjusted_labels,
+            regime_model_params=regime_model_params,
+            blender_model_params=blender_model_params,
+            direction_model_params=direction_model_params,
             # Ablation flags
             disable_ml_features=args.disable_ml_features,
             disable_regime_context=args.disable_regime_context,
@@ -2282,7 +2401,9 @@ def main():
             },
             "evaluation": {
                 "eval_mode": args.eval_mode,
-                "transaction_cost_bps": args.fee_bps
+                "transaction_cost_bps": transaction_cost_bps,
+                "taker_fee_bps": taker_fee_bps,
+                "slippage_bps": slippage_bps
             },
             "ablation": {
                 "disable_ml_features": args.disable_ml_features,
@@ -2297,7 +2418,14 @@ def main():
             "label_config": {
                 "horizon_bars": HORIZON_BARS,
                 "label_threshold": LABEL_THRESHOLD,
-                "smoothing_window": SMOOTHING_WINDOW
+                "smoothing_window": SMOOTHING_WINDOW,
+                "cost_adjusted": cost_adjusted_labels
+            },
+            "model_config": {
+                "deep_train": args.deep_train,
+                "regime_model_params": regime_model_params,
+                "blender_model_params": blender_model_params,
+                "direction_model_params": direction_model_params
             },
             "regime_label_strategy": regime_label_strategy,
             "walkforward": {
@@ -2346,6 +2474,8 @@ def main():
         horizon_bars=HORIZON_BARS,
         label_threshold=LABEL_THRESHOLD,
         smoothing_window=SMOOTHING_WINDOW,
+        cost_bps_per_side=transaction_cost_bps,
+        cost_adjusted=cost_adjusted_labels,
         debug=True
     )
     
@@ -2515,7 +2645,7 @@ def main():
     print("TRAINING REGIME DETECTOR")
     print("="*60)
     print(f"Training on {len(X_regime_train)} samples...")
-    regime_detector = RegimeDetector(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
+    regime_detector = RegimeDetector(model_params=regime_model_params, use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
     regime_detector.fit(X_regime_train_scaled, y_regime_train)  # Train on scaled training set only
     
     # Validate on validation set
@@ -2569,12 +2699,13 @@ def main():
             models_dir=models_dir,
             results_dir=results_dir,
             use_gpu=use_cuml,
-            random_state=args.seed
+            random_state=args.seed,
+            model_params=blender_model_params
         )
     else:
         # Legacy training path
         print(f"Training on {len(X_blend_train)} samples...")
-        signal_blender = SignalBlender(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
+        signal_blender = SignalBlender(model_params=blender_model_params, use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
         signal_blender.fit(
             X_blend_train_scaled, 
             y_blend_train,
@@ -2651,11 +2782,11 @@ def main():
         df['close'].reindex(blend_pred_val.index),
         horizon_bars=HORIZON_BARS,
         eval_mode=args.eval_mode,
-        transaction_cost_bps=args.fee_bps
+        transaction_cost_bps=transaction_cost_bps
     )
     print(f"\n[SignalBlender] Return metrics (validation):")
     print(f"  Eval mode: {signal_return_metrics['eval_mode']}")
-    print(f"  Fee (bps): {signal_return_metrics['transaction_cost_bps']:.2f}")
+    print(f"  Cost per side (bps): {signal_return_metrics['transaction_cost_bps']:.2f}")
     print(f"  Total cost: {signal_return_metrics['total_cost']:.6f}")
     print(f"  Net cumulative return: {signal_return_metrics['cumulative_return']:.4f}")
     print(f"  Gross cumulative return: {signal_return_metrics['gross_cumulative_return']:.4f}")
@@ -2737,12 +2868,13 @@ def main():
             models_dir=models_dir,
             results_dir=results_dir,
             use_gpu=use_cuml,
-            random_state=args.seed
+            random_state=args.seed,
+            model_params=direction_model_params
         )
     else:
         # Legacy training path
         print(f"\nTraining DirectionBlender on {len(X_blend_trade_train)} trade samples...")
-        direction_blender = DirectionBlender(use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
+        direction_blender = DirectionBlender(model_params=direction_model_params, use_gpu=use_cuml, random_state=args.seed)  # GPU-accelerated training
         direction_blender.fit(
             X_blend_trade_train, 
             y_direction_train,
@@ -2812,11 +2944,11 @@ def main():
         df['close'].reindex(direction_pred_val.index),
         horizon_bars=HORIZON_BARS,
         eval_mode=args.eval_mode,
-        transaction_cost_bps=args.fee_bps
+        transaction_cost_bps=transaction_cost_bps
     )
     print(f"\n[DirectionBlender] Return metrics (validation):")
     print(f"  Eval mode: {direction_return_metrics['eval_mode']}")
-    print(f"  Fee (bps): {direction_return_metrics['transaction_cost_bps']:.2f}")
+    print(f"  Cost per side (bps): {direction_return_metrics['transaction_cost_bps']:.2f}")
     print(f"  Total cost: {direction_return_metrics['total_cost']:.6f}")
     print(f"  Net cumulative return: {direction_return_metrics['cumulative_return']:.4f}")
     print(f"  Gross cumulative return: {direction_return_metrics['gross_cumulative_return']:.4f}")
@@ -2895,16 +3027,19 @@ def main():
         yb_val_r = y_blend_val[mask_val]
         
         # Create model with custom parameters for regime-specific training
-        model_params = {
-            'n_estimators': 300,
-            'max_depth': 10,
-            'n_bins': 128,
-            'split_criterion': 0,
-            'bootstrap': True,
-            'max_samples': 0.8,
-            'max_features': 0.9,
-            'n_streams': 4
-        }
+        if blender_model_params is None:
+            model_params = {
+                'n_estimators': 300,
+                'max_depth': 10,
+                'n_bins': 128,
+                'split_criterion': 0,
+                'bootstrap': True,
+                'max_samples': 0.8,
+                'max_features': 0.9,
+                'n_streams': 4
+            }
+        else:
+            model_params = blender_model_params.copy()
         model_r = SignalBlender(model_params=model_params, use_gpu=use_cuml, random_state=args.seed)
         
         print(f"Training SignalBlender[{regime_name}]...")
@@ -2983,16 +3118,19 @@ def main():
         )
         
         # Create model with custom parameters for regime-specific training
-        model_params = {
-            'n_estimators': 300,
-            'max_depth': 10,
-            'n_bins': 128,
-            'split_criterion': 0,
-            'bootstrap': True,
-            'max_samples': 0.8,
-            'max_features': 0.9,
-            'n_streams': 4
-        }
+        if direction_model_params is None:
+            model_params = {
+                'n_estimators': 300,
+                'max_depth': 10,
+                'n_bins': 128,
+                'split_criterion': 0,
+                'bootstrap': True,
+                'max_samples': 0.8,
+                'max_features': 0.9,
+                'n_streams': 4
+            }
+        else:
+            model_params = direction_model_params.copy()
         model_r = DirectionBlender(model_params=model_params, use_gpu=use_cuml, random_state=args.seed)
         
         print(f"Training DirectionBlender[{regime_name}]...")
@@ -3089,7 +3227,9 @@ def main():
         },
         "evaluation": {
             "eval_mode": args.eval_mode,
-            "transaction_cost_bps": args.fee_bps
+            "transaction_cost_bps": transaction_cost_bps,
+            "taker_fee_bps": taker_fee_bps,
+            "slippage_bps": slippage_bps
         },
         "ablation": {
             "disable_ml_features": args.disable_ml_features,
@@ -3104,7 +3244,14 @@ def main():
         "label_config": {
             "horizon_bars": HORIZON_BARS,
             "label_threshold": LABEL_THRESHOLD,
-            "smoothing_window": SMOOTHING_WINDOW
+            "smoothing_window": SMOOTHING_WINDOW,
+            "cost_adjusted": cost_adjusted_labels
+        },
+        "model_config": {
+            "deep_train": args.deep_train,
+            "regime_model_params": regime_model_params,
+            "blender_model_params": blender_model_params,
+            "direction_model_params": direction_model_params
         },
         "regime_label_strategy": regime_label_strategy,
         "modules": {

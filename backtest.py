@@ -297,8 +297,8 @@ def main():
                         help='Probability threshold for short trades (overrides --p for shorts)')
     parser.add_argument('--profile', type=str, default=None,
                         help=f'Use named profile configuration. Available: {", ".join(list_profiles())}')
-    parser.add_argument('--fee-bps-per-side', type=float, default=2.0,
-                        help='Fee in basis points per side (default: 2.0)')
+    parser.add_argument('--fee-bps-per-side', type=float, default=4.5,
+                        help='Taker fee in basis points per side (default: 4.5, Hyperliquid perps base-tier)')
     parser.add_argument('--slippage-bps-per-side', type=float, default=1.0,
                         help='Slippage in basis points per side (default: 1.0)')
     parser.add_argument('--disable-shorts', action='store_true',
@@ -347,7 +347,7 @@ def main():
     p_long = args.p_long if args.p_long is not None else prob_threshold
     p_short = args.p_short if args.p_short is not None else prob_threshold
     
-    # Transaction costs
+    # Transaction costs (taker fee + slippage)
     fee_bps = args.fee_bps_per_side
     slippage_bps = args.slippage_bps_per_side
     total_cost_bps = 2 * (fee_bps + slippage_bps)  # Round trip cost
@@ -373,8 +373,8 @@ def main():
     print(f"  p (general): {prob_threshold}")
     print(f"  p_long: {p_long}")
     print(f"  p_short: {p_short}")
-    print(f"Transaction costs:")
-    print(f"  fee: {fee_bps} bps/side")
+    print(f"Transaction costs (taker model):")
+    print(f"  taker fee: {fee_bps} bps/side")
     print(f"  slippage: {slippage_bps} bps/side")
     print(f"  total round-trip: {total_cost_bps} bps ({total_cost_bps/100:.2f}%)")
     print("="*60 + "\n")
@@ -635,20 +635,22 @@ def main():
     strategy_returns = positions * future_returns
     strategy_returns.name = 'strategy_returns'
     
-    # 9. Apply transaction costs per-trade (in same units as returns)
-    # Compute round-trip cost in fractional form
+    # 9. Apply transaction costs on position changes (in same units as returns)
+    # Compute per-side cost in fractional form
     fee_frac = fee_bps / 10000.0
     slip_frac = slippage_bps / 10000.0
-    round_trip_cost = 2.0 * (fee_frac + slip_frac)  # Entry + exit
+    per_side_cost = fee_frac + slip_frac
     
-    # Apply cost on every bar where we have a trade (signal != 0)
-    # This treats each bar with non-zero signal as a full round-trip
+    # Apply cost only when position changes (entry/exit/flip)
+    # position_change of +/-1 = entry or exit, +/-2 = flip (exit+entry)
+    position_change = positions.diff().fillna(positions)
+    cost_units = position_change.abs()
+    costs = cost_units * per_side_cost
+    costs.name = 'costs'
+    
+    # Apply cost: subtract costs from returns on change bars
     trade_mask = positions != 0
-    cost_per_trade = round_trip_cost
-    
-    # Apply cost: subtract cost from returns on bars where we have a trade
-    strategy_returns_net = strategy_returns.copy()
-    strategy_returns_net[trade_mask] = strategy_returns_net[trade_mask] - cost_per_trade
+    strategy_returns_net = strategy_returns - costs
     strategy_returns_net.name = 'strategy_returns_net'
     
     # Use net returns for PnL calculation
@@ -666,10 +668,39 @@ def main():
     pnl_raw = pnl_raw[valid_mask]
     future_returns = future_returns[valid_mask]
     trade_mask = trade_mask[valid_mask]
+    costs = costs[valid_mask]
+    
+    trade_bar_count = int(trade_mask.sum())
+    
+    trade_segments = pd.DataFrame({
+        'position': positions,
+        'pnl_raw': pnl_raw,
+        'pnl': pnl,
+    }, index=positions.index)
+    trade_segments['segment_id'] = (trade_segments['position'] != trade_segments['position'].shift()).cumsum()
+    trade_segments = trade_segments[trade_segments['position'] != 0]
+    
+    if len(trade_segments) > 0:
+        trade_summary = trade_segments.groupby('segment_id').agg(
+            position=('position', 'first'),
+            pnl_raw=('pnl_raw', 'sum'),
+            pnl=('pnl', 'sum')
+        )
+        entry_times = trade_segments.groupby('segment_id').apply(lambda x: x.index[0])
+        trade_summary['entry_time'] = entry_times
+        trade_summary = trade_summary.set_index('entry_time')
+    else:
+        trade_summary = pd.DataFrame(columns=['position', 'pnl_raw', 'pnl'])
+    
+    if len(trade_summary) > 0:
+        trade_summary['regime'] = regime_pred.reindex(trade_summary.index).fillna('unknown')
+    else:
+        trade_summary['regime'] = pd.Series(dtype=object)
     
     # Compute total costs for informational purposes only (after filtering)
-    num_trades = trade_mask.sum()
-    total_transaction_costs = num_trades * cost_per_trade
+    num_trades = len(trade_summary)
+    total_transaction_costs = costs.sum()
+    avg_cost_per_trade = total_transaction_costs / num_trades if num_trades > 0 else 0.0
     
     # 10. Compute cumulative equity curve from net returns
     # Start with initial capital of 1.0, then compound returns
@@ -690,12 +721,19 @@ def main():
     print(f"Hit Rate: {metrics['hit_rate']:.2%}")
     print(f"Long Accuracy: {metrics['long_accuracy']:.2%}")
     print(f"Short Accuracy: {metrics['short_accuracy']:.2%}")
-    print(f"\nNet of costs: fee = {fee_bps} bps/side, slippage = {slippage_bps} bps/side")
+    print(f"\nNet of costs: taker fee = {fee_bps} bps/side, slippage = {slippage_bps} bps/side")
     print(f"Total round-trip cost: {total_cost_bps} bps ({total_cost_bps/100:.2f}%)")
-    print(f"Total transaction costs (approx): {total_transaction_costs:.6f}")
+    print(f"Total transaction costs (actual): {total_transaction_costs:.6f}")
     print(f"\nTotal Trades: {num_trades}")
-    print(f"Long Trades: {(positions > 0).sum()}")
-    print(f"Short Trades: {(positions < 0).sum()}")
+    if num_trades > 0:
+        long_trades = (trade_summary['position'] > 0).sum()
+        short_trades = (trade_summary['position'] < 0).sum()
+    else:
+        long_trades = 0
+        short_trades = 0
+    print(f"Long Trades: {long_trades}")
+    print(f"Short Trades: {short_trades}")
+    print(f"Trade Bars: {trade_bar_count}")
     print(f"Flat Periods: {(positions == 0).sum()}")
     
     # 11.5. Build detailed breakdown DataFrame
@@ -719,8 +757,8 @@ def main():
     print("SIDE-BY-SIDE STATS")
     print("="*60)
     
-    long_mask = bt['signal'] == 1
-    short_mask = bt['signal'] == -1
+    long_mask = trade_summary['position'] == 1
+    short_mask = trade_summary['position'] == -1
     
     for side_name, mask in [('LONG', long_mask), ('SHORT', short_mask)]:
         if mask.sum() == 0:
@@ -728,7 +766,7 @@ def main():
             print(f"  No trades")
             continue
         
-        side_pnl = bt.loc[mask, 'trade_pnl']
+        side_pnl = trade_summary.loc[mask, 'pnl']
         side_equity = (1 + side_pnl).cumprod()
         
         total_return = side_equity.iloc[-1] / side_equity.iloc[0] - 1.0 if len(side_equity) > 0 else 0.0
@@ -758,16 +796,17 @@ def main():
     for regime_name in ['trend_up', 'trend_down', 'chop']:
         regime_mask = (bt['regime'] == regime_name)
         bars_in_regime = regime_mask.sum()
+        trade_regime_mask = trade_summary['regime'] == regime_name
         
         if bars_in_regime == 0:
             continue
         
-        trades_in_regime = ((bt['signal'] != 0) & regime_mask).sum()
-        long_trades = ((bt['signal'] == 1) & regime_mask).sum()
-        short_trades = ((bt['signal'] == -1) & regime_mask).sum()
+        trades_in_regime = trade_regime_mask.sum()
+        long_trades = (trade_regime_mask & (trade_summary['position'] == 1)).sum()
+        short_trades = (trade_regime_mask & (trade_summary['position'] == -1)).sum()
         
         # PnL of trades in this regime
-        regime_trade_pnl = bt.loc[regime_mask & (bt['signal'] != 0), 'trade_pnl']
+        regime_trade_pnl = trade_summary.loc[trade_regime_mask, 'pnl']
         total_pnl = regime_trade_pnl.sum() if len(regime_trade_pnl) > 0 else 0.0
         hit_rate = (regime_trade_pnl > 0).mean() if len(regime_trade_pnl) > 0 else 0.0
         
@@ -802,20 +841,20 @@ def main():
     print("PER-REGIME + SIDE STATS")
     print("="*60)
     
-    # Filter to only trade bars (signal != 0)
-    trade_bt = bt[bt['signal'] != 0].copy()
+    # Trade-level regime + side stats
+    trade_bt = trade_summary.copy()
     
     if len(trade_bt) > 0:
-        # Group by regime and signal
-        grouped = trade_bt.groupby(['regime', 'signal'])
+        # Group by regime and position
+        grouped = trade_bt.groupby(['regime', 'position'])
         
         breakdown_stats = []
         for (regime_name, signal_val), group in grouped:
             signal_name = 'long' if signal_val == 1 else 'short'
             trade_count = len(group)
-            hit_rate = (group['trade_pnl'] > 0).mean() if trade_count > 0 else 0.0
-            avg_trade_return = group['trade_pnl'].mean() if trade_count > 0 else 0.0
-            total_pnl = group['trade_pnl'].sum()
+            hit_rate = (group['pnl'] > 0).mean() if trade_count > 0 else 0.0
+            avg_trade_return = group['pnl'].mean() if trade_count > 0 else 0.0
+            total_pnl = group['pnl'].sum()
             
             breakdown_stats.append({
                 'regime': regime_name,
@@ -843,12 +882,12 @@ def main():
     print("TRANSACTION-COST-AWARE DIAGNOSTICS")
     print("="*60)
     
-    # Filter to only trade bars for gross return analysis
-    trade_bt_gross = bt[bt['signal'] != 0].copy()
+    # Trade-level gross return analysis
+    trade_bt_gross = trade_summary.copy()
     
     if len(trade_bt_gross) > 0:
         # Overall gross return statistics (before costs)
-        gross_returns = trade_bt_gross['trade_pnl_raw']
+        gross_returns = trade_bt_gross['pnl_raw']
         avg_gross = gross_returns.mean()
         median_gross = gross_returns.median()
         percentiles = gross_returns.quantile([0.05, 0.25, 0.50, 0.75, 0.95])
@@ -865,9 +904,9 @@ def main():
         print(f"    95th: {percentiles[0.95]:.6f} ({percentiles[0.95]*100:.4f}%)")
         
         # Cost comparison
-        print(f"\n[COST ANALYSIS] Round-trip cost: {cost_per_trade:.6f} ({cost_per_trade*100:.4f}%)")
+        print(f"\n[COST ANALYSIS] Avg cost per trade: {avg_cost_per_trade:.6f} ({avg_cost_per_trade*100:.4f}%)")
         if avg_gross != 0:
-            cost_avg_ratio = cost_per_trade / abs(avg_gross)
+            cost_avg_ratio = avg_cost_per_trade / abs(avg_gross)
             print(f"  cost / avg_gross = {cost_avg_ratio:.2f}x")
             if cost_avg_ratio > 1.0:
                 print(f"  ⚠️  WARNING: Cost exceeds average gross return!")
@@ -879,7 +918,7 @@ def main():
             print(f"  cost / avg_gross = N/A (avg_gross is zero)")
         
         if median_gross != 0:
-            cost_median_ratio = cost_per_trade / abs(median_gross)
+            cost_median_ratio = avg_cost_per_trade / abs(median_gross)
             print(f"  cost / median_gross = {cost_median_ratio:.2f}x")
             if cost_median_ratio > 1.0:
                 print(f"  ⚠️  WARNING: Cost exceeds median gross return!")
@@ -893,12 +932,12 @@ def main():
         # Per-side gross return statistics
         print("\n[PER-SIDE] Gross Return Statistics (before costs):")
         for side_name, side_val in [('LONG', 1), ('SHORT', -1)]:
-            side_mask = trade_bt_gross['signal'] == side_val
+            side_mask = trade_bt_gross['position'] == side_val
             if side_mask.sum() == 0:
                 print(f"\n  {side_name}: No trades")
                 continue
             
-            side_gross = trade_bt_gross.loc[side_mask, 'trade_pnl_raw']
+            side_gross = trade_bt_gross.loc[side_mask, 'pnl_raw']
             side_avg = side_gross.mean()
             side_median = side_gross.median()
             side_percentiles = side_gross.quantile([0.05, 0.25, 0.50, 0.75, 0.95])
@@ -911,7 +950,7 @@ def main():
                   f"50th={side_percentiles[0.50]:.6f}, 75th={side_percentiles[0.75]:.6f}, 95th={side_percentiles[0.95]:.6f}")
             
             if side_avg != 0:
-                side_cost_avg_ratio = cost_per_trade / abs(side_avg)
+                side_cost_avg_ratio = avg_cost_per_trade / abs(side_avg)
                 print(f"    cost / avg_gross = {side_cost_avg_ratio:.2f}x", end="")
                 if side_cost_avg_ratio > 1.0:
                     print(" ⚠️")
@@ -928,11 +967,11 @@ def main():
                 continue
             
             for side_name, side_val in [('long', 1), ('short', -1)]:
-                combo_mask = regime_mask & (trade_bt_gross['signal'] == side_val)
+                combo_mask = regime_mask & (trade_bt_gross['position'] == side_val)
                 if not combo_mask.any():
                     continue
                 
-                combo_gross = trade_bt_gross.loc[combo_mask, 'trade_pnl_raw']
+                combo_gross = trade_bt_gross.loc[combo_mask, 'pnl_raw']
                 combo_avg = combo_gross.mean()
                 combo_median = combo_gross.median()
                 combo_percentiles = combo_gross.quantile([0.05, 0.25, 0.50, 0.75, 0.95])
@@ -945,7 +984,7 @@ def main():
                       f"50th={combo_percentiles[0.50]:.6f}, 75th={combo_percentiles[0.75]:.6f}, 95th={combo_percentiles[0.95]:.6f}")
                 
                 if combo_avg != 0:
-                    combo_cost_avg_ratio = cost_per_trade / abs(combo_avg)
+                    combo_cost_avg_ratio = avg_cost_per_trade / abs(combo_avg)
                     print(f"    cost / avg_gross = {combo_cost_avg_ratio:.2f}x", end="")
                     if combo_cost_avg_ratio > 1.0:
                         print(" ⚠️  WARNING: Cost exceeds average gross return!")
@@ -1035,8 +1074,9 @@ def main():
     print("="*60)
     raw_total_pnl = pnl_raw.sum()
     net_total_pnl = pnl.sum()
-    print(f"  Num trades: {num_trades}")
-    print(f"  Cost per trade (fraction): {cost_per_trade:.6f}")
+    print(f"  Num trades (entries): {num_trades}")
+    print(f"  Trade bars: {trade_bar_count}")
+    print(f"  Avg cost per trade (fraction): {avg_cost_per_trade:.6f}")
     print(f"  Approx total cost: {total_transaction_costs:.6f}")
     print(f"  Raw total PnL (no cost): {raw_total_pnl:.6f}")
     print(f"  Net total PnL (with cost): {net_total_pnl:.6f}")

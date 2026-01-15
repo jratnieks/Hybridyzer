@@ -5,7 +5,7 @@ Functions to generate labels for training regime detector and signal blender.
 NEW LABEL SYSTEM (v2):
 - Forward return over configurable horizon (default: 12 bars = 1 hour for 5-min data)
 - 12-bar rolling mean smoothing to remove micro-noise
-- Fixed threshold classification (default: 0.0005)
+- Fixed threshold classification (default: 0.0005), optionally cost-adjusted
 - No ATR normalization or volatility adjustments
 """
 
@@ -20,6 +20,8 @@ def make_direction_labels(
     horizon_bars: int = 12,
     label_threshold: float = 0.0005,
     smoothing_window: int = 12,
+    cost_bps_per_side: float = 0.0,
+    cost_adjusted: bool = False,
     debug: bool = True
 ) -> pd.DataFrame:
     """
@@ -33,6 +35,8 @@ def make_direction_labels(
         horizon_bars: Forward horizon in bars (default: 12 = 1 hour for 5-min data)
         label_threshold: Threshold for label assignment (default: 0.0005 = 0.05%)
         smoothing_window: Rolling window for smoothing returns (default: 12)
+        cost_bps_per_side: Transaction cost per side in bps (default: 0.0)
+        cost_adjusted: If True, add round-trip costs to the label threshold (default: False)
         debug: Whether to print label statistics (default: True)
         
     Returns:
@@ -40,6 +44,9 @@ def make_direction_labels(
         - future_return: Raw future return over horizon (close.shift(-H) / close - 1)
         - smoothed_return: 12-bar rolling mean of future_return
         - blend_label: Direction label (-1, 0, +1) based on smoothed return vs threshold
+        - threshold: Base label threshold
+        - effective_threshold: Threshold after adding round-trip costs (if enabled)
+        - round_trip_cost: Round-trip cost as a fraction
     """
     df = df.copy()
     close = df['close']
@@ -60,23 +67,35 @@ def make_direction_labels(
     # else:                       label = 0
     blend_label = pd.Series(0, index=df.index, dtype=int)
     
+    if cost_bps_per_side is None:
+        per_side_cost = 0.0
+    else:
+        per_side_cost = max(0.0, float(cost_bps_per_side)) / 10000.0
+    round_trip_cost = 2.0 * per_side_cost
+    effective_threshold = label_threshold + round_trip_cost if cost_adjusted else label_threshold
+    
     # Only label when we have valid smoothed values
     valid_mask = ~smoothed_return.isna()
     if valid_mask.any():
-        blend_label[valid_mask & (smoothed_return > label_threshold)] = 1
-        blend_label[valid_mask & (smoothed_return < -label_threshold)] = -1
+        blend_label[valid_mask & (smoothed_return > effective_threshold)] = 1
+        blend_label[valid_mask & (smoothed_return < -effective_threshold)] = -1
     
     df['blend_label'] = blend_label
     
     # Store threshold for reference (constant value)
     df['threshold'] = label_threshold
+    df['effective_threshold'] = effective_threshold
+    df['round_trip_cost'] = round_trip_cost
     
     # Debug output
     if debug:
         _print_label_debug_stats(
             horizon_bars=horizon_bars,
             label_threshold=label_threshold,
+            effective_threshold=effective_threshold,
             smoothing_window=smoothing_window,
+            round_trip_cost=round_trip_cost,
+            cost_adjusted=cost_adjusted,
             future_return=future_return,
             smoothed_return=smoothed_return,
             blend_label=blend_label
@@ -88,7 +107,10 @@ def make_direction_labels(
 def _print_label_debug_stats(
     horizon_bars: int,
     label_threshold: float,
+    effective_threshold: float,
     smoothing_window: int,
+    round_trip_cost: float,
+    cost_adjusted: bool,
     future_return: pd.Series,
     smoothed_return: pd.Series,
     blend_label: pd.Series
@@ -109,6 +131,9 @@ def _print_label_debug_stats(
     print("="*60)
     print(f"[NEW LABELS] Horizon: {horizon_bars} bars")
     print(f"[NEW LABELS] Threshold: {label_threshold}")
+    if cost_adjusted and round_trip_cost > 0:
+        print(f"[NEW LABELS] Round-trip cost: {round_trip_cost:.6f} ({round_trip_cost*100:.4f}%)")
+        print(f"[NEW LABELS] Effective threshold: {effective_threshold}")
     print(f"[NEW LABELS] Smoothing window: {smoothing_window} bars")
     
     # Label distribution

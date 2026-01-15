@@ -78,6 +78,20 @@ class RegimeDetector:
             raise RuntimeError("cuML/cuDF are required when use_gpu=True") from exc
         return cudf, cuRFClassifier
 
+    def _model_is_cuml(self) -> bool:
+        if self.model is None:
+            return False
+        module_name = getattr(self.model.__class__, "__module__", "")
+        return module_name.startswith("cuml")
+
+    @staticmethod
+    def _to_numpy(values) -> np.ndarray:
+        if hasattr(values, "to_pandas"):
+            return values.to_pandas().values
+        if hasattr(values, "get"):
+            return values.get()
+        return np.asarray(values)
+
     def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
         """
         Train the regime detection model on GPU using cuML.
@@ -180,15 +194,12 @@ class RegimeDetector:
         # Align index
         X_clean = X_clean.reindex(X.index)
         
-        # GPU: Convert to cuDF and predict
-        if self.use_gpu:
+        # GPU: Convert to cuDF and predict if model is cuML
+        if self._model_is_cuml():
             cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
-            predictions_numeric_gpu = self.model.predict(X_gpu)
-            # Convert back to pandas
-            predictions_numeric = predictions_numeric_gpu.to_pandas().values
+            predictions_numeric = self._to_numpy(self.model.predict(X_gpu))
         else:
-            # CPU: Predict directly
             predictions_numeric = self.model.predict(X_clean)
         
         # Convert back to regime labels
@@ -231,15 +242,12 @@ class RegimeDetector:
         # Align index
         X_clean = X_clean.reindex(X.index)
         
-        # GPU: Convert to cuDF and predict probabilities
-        if self.use_gpu:
+        # GPU: Convert to cuDF and predict probabilities if model is cuML
+        if self._model_is_cuml():
             cudf = self._cudf or self._require_cuml()[0]
             X_gpu = cudf.from_pandas(X_clean)
-            proba_gpu = self.model.predict_proba(X_gpu)
-            # Convert back to pandas
-            proba = proba_gpu.to_pandas().values
+            proba = self._to_numpy(self.model.predict_proba(X_gpu))
         else:
-            # CPU: Predict probabilities directly
             proba = self.model.predict_proba(X_clean)
         
         # Create dataframe with regime labels as columns
