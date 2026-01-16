@@ -73,31 +73,76 @@ def infer(
 
 def main():
     """
-    Main inference function.
+    Main inference function - runs on test data.
     """
-    # TODO: Load incoming bar data
-    # This should be called with real-time or batch data
-    print("Loading data...")
+    import argparse
+    parser = argparse.ArgumentParser(description="Run inference on test data")
+    parser.add_argument("--data", type=str, default="data/btcusd_5min_test_2025.csv",
+                        help="Path to data file (default: 2025 test data)")
+    parser.add_argument("--threshold", type=float, default=0.60,
+                        help="Probability threshold for trades (default: 0.60)")
+    parser.add_argument("--require-agreement", action="store_true",
+                        help="Require SignalBlender agreement")
+    parser.add_argument("--tail", type=int, default=20,
+                        help="Show last N signals (default: 20)")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Disable GPU (use CPU only)")
+    args = parser.parse_args()
     
-    # Placeholder - replace with actual data loading
-    df = pd.DataFrame()
+    print(f"Loading data from {args.data}...")
+    
+    try:
+        df = pd.read_csv(args.data, parse_dates=['timestamp'], index_col='timestamp')
+    except FileNotFoundError:
+        print(f"Error: Data file not found: {args.data}")
+        return
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return
     
     if df.empty:
         print("No data provided. Exiting.")
         return
     
-    # Run inference with configurable parameters
-    result = infer(
+    print(f"Loaded {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+    print(f"Running inference with threshold={args.threshold}...")
+    
+    # Run inference
+    results = infer(
         df,
-        probability_threshold=0.60,  # Minimum confidence for taking a trade
-        require_blender_agreement=False  # Set to True to require 3-class SignalBlender agreement
+        probability_threshold=args.threshold,
+        require_blender_agreement=args.require_agreement,
+        use_gpu=not args.no_gpu
     )
     
-    print("\nInference results:")
-    print(f"  Regime: {result['regime']}")
-    print(f"  Signal: {result['signal']}")
-    print(f"  Confidence: {result['confidence']:.4f}")
-    print(f"  Direction Probability: {result['direction_proba']:.4f}")
+    # Create summary dataframe
+    summary = pd.DataFrame({
+        'regime': results['regime'],
+        'signal': results['signal'],
+        'confidence': results['confidence'],
+        'direction_proba': results['direction_proba']
+    })
+    
+    # Signal distribution
+    print("\n=== Signal Distribution ===")
+    signal_counts = summary['signal'].value_counts().sort_index()
+    signal_names = {-1: "SHORT", 0: "FLAT", 1: "LONG"}
+    for sig, count in signal_counts.items():
+        pct = 100 * count / len(summary)
+        print(f"  {signal_names.get(sig, sig):>5}: {count:>6} ({pct:.1f}%)")
+    
+    # Regime distribution
+    print("\n=== Regime Distribution ===")
+    regime_counts = summary['regime'].value_counts()
+    for regime, count in regime_counts.items():
+        pct = 100 * count / len(summary)
+        print(f"  {regime:>12}: {count:>6} ({pct:.1f}%)")
+    
+    # Show last N signals
+    print(f"\n=== Last {args.tail} Signals ===")
+    tail_df = summary.tail(args.tail).copy()
+    tail_df['signal_name'] = tail_df['signal'].map(signal_names)
+    print(tail_df[['regime', 'signal_name', 'confidence', 'direction_proba']].to_string())
 
 
 if __name__ == "__main__":

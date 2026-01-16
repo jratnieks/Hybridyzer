@@ -128,6 +128,10 @@ class TrendMagicV2(SignalModule):
         s = src.values
         dt = decayt.values
         db = decayb.values
+        
+        # Handle NaN in decay values (warmup period) - use 0 decay
+        dt = np.nan_to_num(dt, nan=0.0)
+        db = np.nan_to_num(db, nan=0.0)
 
         last_top_touch = -1
         last_bot_touch = -1
@@ -135,6 +139,13 @@ class TrendMagicV2(SignalModule):
         for i in range(len(df)):
             prev_top = topvec[i-1] if i > 0 else s[i]
             prev_bot = botvec[i-1] if i > 0 else s[i]
+            
+            # Handle NaN propagation - reset to current price if prev is NaN
+            if np.isnan(prev_top):
+                prev_top = s[i]
+            if np.isnan(prev_bot):
+                prev_bot = s[i]
+                
             prev_tfc = top_fc[i-1] if i > 0 else self.topstage1
             prev_bfc = bot_fc[i-1] if i > 0 else self.botstage1
 

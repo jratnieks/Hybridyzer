@@ -811,21 +811,19 @@ class SignalDynamicsFeatures:
         module_signals = {}
         for module in self.signal_modules:
             try:
-                # Get module-specific features (handle legacy_ prefix)
-                # Try both legacy_ prefix and direct prefix for backward compatibility
-                legacy_prefix = f"legacy_{module.name}_"
-                direct_prefix = f"{module.name}_"
+                # Get module-specific features
+                module_prefix = f"{module.name}_"
                 module_feat_cols = [
                     c for c in unified_features.columns 
-                    if c.startswith(legacy_prefix) or c.startswith(direct_prefix)
+                    if c.startswith(module_prefix)
                 ]
                 if not module_feat_cols:
                     continue
                 
                 module_features = unified_features[module_feat_cols].copy()
-                # Remove prefix for module's compute_signal (handle both legacy_ and direct)
+                # Remove prefix for module's compute_signal
                 module_features.columns = [
-                    c.replace(legacy_prefix, "").replace(direct_prefix, "") 
+                    c.replace(module_prefix, "") 
                     for c in module_features.columns
                 ]
                 
@@ -852,10 +850,8 @@ class SignalDynamicsFeatures:
         # Use GPU acceleration if available, with automatic fallback on errors
         hull_modules = ["superma", "pvt", "trendmagic"]
         for module_name in hull_modules:
-            # Try legacy_ prefix first, then fallback to direct prefix
-            hull_col = f"legacy_{module_name}_hull"
-            if hull_col not in unified_features.columns:
-                hull_col = f"{module_name}_hull"
+            # Use module prefix (consistent with training)
+            hull_col = f"{module_name}_hull"
             if hull_col in unified_features.columns:
                 hull = unified_features[hull_col]
                 if self.use_gpu_effective:
@@ -877,16 +873,12 @@ class SignalDynamicsFeatures:
         # Derivative of topvec and botvec
         # Dynamically detect column names (different modules may use different naming)
         for module_name in hull_modules:
-            # Candidate column names (with legacy_ prefix first, then fallback to direct prefix)
+            # Candidate column names (consistent with training)
             topvec_candidates = [
-                f"legacy_{module_name}_topvector01",
-                f"legacy_{module_name}_topvecMA",
                 f"{module_name}_topvector01",
                 f"{module_name}_topvecMA"
             ]
             botvec_candidates = [
-                f"legacy_{module_name}_botvector01",
-                f"legacy_{module_name}_botvecMA",
                 f"{module_name}_botvector01",
                 f"{module_name}_botvecMA"
             ]
@@ -1326,52 +1318,14 @@ class FeatureStore:
                 print(f"[FeatureStore] Disabled context modules: {disabled_context}")
         if self.include_feature_patterns or self.exclude_feature_patterns:
             print("[FeatureStore] Feature filtering enabled (include/exclude patterns)")
-
-    @staticmethod
-    def _compile_feature_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
-        if not patterns:
-            return []
-        compiled = []
-        for pattern in patterns:
-            if not pattern:
-                continue
-            compiled.append(re.compile(pattern))
-        return compiled
-
-    def _apply_feature_filters(self, features: pd.DataFrame) -> pd.DataFrame:
-        if not self.include_feature_patterns and not self.exclude_feature_patterns:
-            return features
-
-        columns = list(features.columns)
-        if self.include_feature_patterns:
-            keep = [
-                col for col in columns
-                if any(p.search(col) for p in self.include_feature_patterns)
-            ]
-        else:
-            keep = columns
-
-        if self.exclude_feature_patterns:
-            keep = [
-                col for col in keep
-                if not any(p.search(col) for p in self.exclude_feature_patterns)
-            ]
-
-        filtered = features[keep]
-        dropped = len(columns) - len(filtered.columns)
-        if dropped > 0:
-            print(f"[FeatureStore] Feature filters dropped {dropped} columns")
-        if filtered.shape[1] == 0:
-            raise ValueError("Feature filters removed all features; adjust include/exclude patterns.")
-        return filtered
         
         # Apply safe_mode defaults
         if safe_mode:
             if rolling_windows is None:
                 rolling_windows = [5, 20]
             if rolling_stats_columns is None:
-                # Safe default subset (with legacy_ prefix since we namespace module features)
-                rolling_stats_columns = ["legacy_superma_hull", "legacy_trendmagic_hls", "legacy_pvt_hull"]
+                # Safe default subset (matching training feature naming)
+                rolling_stats_columns = ["superma_hull", "trendmagic_hls", "pvt_hull"]
         else:
             if rolling_windows is None:
                 rolling_windows = [5, 20]  # Still use reduced windows by default
@@ -1410,6 +1364,44 @@ class FeatureStore:
             chunk_size=chunk_size
         ) if self.generate_ml_features else None
 
+    @staticmethod
+    def _compile_feature_patterns(patterns: Optional[List[str]]) -> List[re.Pattern]:
+        if not patterns:
+            return []
+        compiled = []
+        for pattern in patterns:
+            if not pattern:
+                continue
+            compiled.append(re.compile(pattern))
+        return compiled
+
+    def _apply_feature_filters(self, features: pd.DataFrame) -> pd.DataFrame:
+        if not self.include_feature_patterns and not self.exclude_feature_patterns:
+            return features
+
+        columns = list(features.columns)
+        if self.include_feature_patterns:
+            keep = [
+                col for col in columns
+                if any(p.search(col) for p in self.include_feature_patterns)
+            ]
+        else:
+            keep = columns
+
+        if self.exclude_feature_patterns:
+            keep = [
+                col for col in keep
+                if not any(p.search(col) for p in self.exclude_feature_patterns)
+            ]
+
+        filtered = features[keep]
+        dropped = len(columns) - len(filtered.columns)
+        if dropped > 0:
+            print(f"[FeatureStore] Feature filters dropped {dropped} columns")
+        if filtered.shape[1] == 0:
+            raise ValueError("Feature filters removed all features; adjust include/exclude patterns.")
+        return filtered
+
     def build(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Build unified feature DataFrame from all modules.
@@ -1434,27 +1426,27 @@ class FeatureStore:
         unified_features = pd.DataFrame(index=df.index)
         all_feature_dfs = []
         
-        # Collect features from signal modules (namespace as legacy_*)
+        # Collect features from signal modules
         for module in self.signal_modules:
             try:
                 module_features = module.compute_features(df)
                 # Align index with base dataframe
                 module_features = module_features.reindex(df.index)
-                # Prefix all columns with legacy_ and module name
-                module_features.columns = [f"legacy_{module.name}_{col}" for col in module_features.columns]
+                # Prefix all columns with module name (consistent with build_features/training)
+                module_features.columns = [f"{module.name}_{col}" for col in module_features.columns]
                 all_feature_dfs.append(module_features)
             except Exception as e:
                 print(f"Warning: Failed to compute features for {module.name}: {e}")
                 continue
         
-        # Collect features from context modules (namespace as legacy_*)
+        # Collect features from context modules
         for module in self.context_modules:
             try:
                 module_features = module.compute_features(df)
                 # Align index with base dataframe
                 module_features = module_features.reindex(df.index)
-                # Prefix all columns with legacy_ and module name
-                module_features.columns = [f"legacy_{module.name}_{col}" for col in module_features.columns]
+                # Prefix all columns with module name (consistent with build_features/training)
+                module_features.columns = [f"{module.name}_{col}" for col in module_features.columns]
                 all_feature_dfs.append(module_features)
             except Exception as e:
                 print(f"Warning: Failed to compute features for {module.name}: {e}")
@@ -1498,25 +1490,20 @@ class FeatureStore:
             clear_gpu_memory()
         
         # Store BASE features before adding derived features (for rolling stats)
-        # Use legacy features only for rolling stats to avoid stats-of-stats
-        legacy_cols = [col for col in unified_features.columns if col.startswith('legacy_')]
-        if legacy_cols:
-            base_features = unified_features[legacy_cols].copy()
+        # Use module features only for rolling stats to avoid stats-of-stats
+        module_names = [m.name for m in self.signal_modules] + [m.name for m in self.context_modules]
+        module_prefixes = [f"{name}_" for name in module_names]
+        base_cols = [col for col in unified_features.columns 
+                     if any(col.startswith(prefix) for prefix in module_prefixes)]
+        if base_cols:
+            base_features = unified_features[base_cols].copy()
         else:
-            # Fallback: use all features if no legacy features found
+            # Fallback: use all features if no module features found
             base_features = unified_features.copy()
         
-        # Safe mode: Remove features with >30% NaNs
-        if self.safe_mode:
-            nan_threshold = 0.30
-            nan_ratios = unified_features.isna().sum() / len(unified_features)
-            valid_cols = nan_ratios[nan_ratios <= nan_threshold].index
-            unified_features = unified_features[valid_cols]
-            # Only filter base_features columns that exist in base_features
-            valid_base_cols = [col for col in valid_cols if col in base_features.columns]
-            base_features = base_features[valid_base_cols]
-            if len(valid_cols) < len(nan_ratios):
-                print(f"[FeatureStore] Removed {len(nan_ratios) - len(valid_cols)} features with >{nan_threshold*100}% NaNs")
+        # NOTE: NaN filtering disabled to match training behavior (build_features doesn't filter)
+        # Models handle NaN values via fillna(0) in their predict methods
+        # If you need NaN filtering, ensure it's also applied during training
         
         # Generate regime context features if enabled
         # Safe mode: Disable for small datasets (<50k rows)

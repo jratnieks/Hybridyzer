@@ -148,7 +148,7 @@ class TestTargetLeakage:
         # Simulate feature columns
         feature_cols = [
             'return_1', 'return_5', 'volatility_20', 'rsi_14',
-            'legacy_superma_hull', 'regime_atr14_norm_close'
+            'superma_hull', 'regime_atr14_norm_close'
         ]
         
         # These should NOT be in features
