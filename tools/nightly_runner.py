@@ -290,6 +290,8 @@ def _build_train_command(args: argparse.Namespace, cfg: Dict[str, object], train
         cmd.append("--runpod")
     if args.use_full_pipeline:
         cmd.append("--use-full-pipeline")
+    if args.deep_train:
+        cmd.append("--deep-train")
     if args.embargo_days:
         cmd.extend(["--embargo-days", str(args.embargo_days)])
     if args.purge_bars:
@@ -434,6 +436,8 @@ def main() -> None:
                         help="Use RunPod paths (/workspace/Hybridyzer)")
     parser.add_argument("--use-full-pipeline", action="store_true",
                         help="Use full training pipeline with feature pruning/diagnostics")
+    parser.add_argument("--deep-train", action="store_true",
+                        help="Use deeper model parameters for regime/blender models")
     parser.add_argument("--embargo-days", type=int, default=0,
                         help="Embargo days between train/val windows")
     parser.add_argument("--purge-bars", type=int, default=0,
