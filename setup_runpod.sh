@@ -18,16 +18,57 @@ if [ ! -f "train.py" ]; then
     exit 1
 fi
 
-# Install core dependencies first
-echo "[1/4] Installing core dependencies..."
-pip install pandas numpy scikit-learn matplotlib pyarrow joblib scipy numba
+# Prefer conda env for isolation when available
+ENV_FILE="environment.runpod.yml"
+ENV_NAME="$(awk -F': ' '/^name:/ {print $2}' "$ENV_FILE" 2>/dev/null || echo "hybridyzer")"
+CONDA_DIR="${CONDA_DIR:-}"
 
-# Install RAPIDS for GPU acceleration
+if command -v conda &>/dev/null; then
+    echo "[1/4] Conda detected. Using isolated env: $ENV_NAME"
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+        conda env update -f "$ENV_FILE"
+    else
+        conda env create -f "$ENV_FILE"
+    fi
+    conda activate "$ENV_NAME"
+    echo "[1/4] Installing extra dependencies in conda env..."
+    pip install joblib scipy numba
+else
+    echo "[1/4] Conda not found. Installing Miniconda for isolation..."
+    if [ -z "$CONDA_DIR" ]; then
+        if [ -w /opt ]; then
+            CONDA_DIR="/opt/conda"
+        else
+            CONDA_DIR="$HOME/miniconda3"
+        fi
+    fi
+    if [ ! -x "$CONDA_DIR/bin/conda" ]; then
+        curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o /tmp/miniconda.sh
+        bash /tmp/miniconda.sh -b -p "$CONDA_DIR"
+    fi
+    export PATH="$CONDA_DIR/bin:$PATH"
+    source "$CONDA_DIR/etc/profile.d/conda.sh"
+    if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+        conda env update -f "$ENV_FILE"
+    else
+        conda env create -f "$ENV_FILE"
+    fi
+    conda activate "$ENV_NAME"
+    echo "[1/4] Installing extra dependencies in conda env..."
+    pip install joblib scipy numba
+fi
+
+# Install RAPIDS for GPU acceleration (pip-only fallback)
 echo ""
 echo "[2/4] Installing RAPIDS GPU libraries..."
-pip install cudf-cu12 cuml-cu12 cupy-cuda12x --extra-index-url=https://pypi.nvidia.com || {
-    echo "Warning: RAPIDS install failed, will use CPU fallback (slower but works)"
-}
+if python -c "import cuml, cudf" &>/dev/null; then
+    echo "RAPIDS already available in conda env"
+else
+    pip install cudf-cu12 cuml-cu12 cupy-cuda12x --extra-index-url=https://pypi.nvidia.com || {
+        echo "Warning: RAPIDS install failed, will use CPU fallback (slower but works)"
+    }
+fi
 
 # Verify GPU is available
 echo ""
