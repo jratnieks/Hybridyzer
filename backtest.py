@@ -7,15 +7,119 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import json
+import os
+import sys
 import matplotlib.pyplot as plt
 import argparse
 from core.feature_store import FeatureStore
+from core.gpu_env import collect_gpu_env
 from core.regime_detector import RegimeDetector
 from core.signal_blender import SignalBlender, DirectionBlender
 from core.final_signal import FinalSignalGenerator
 from core.labeling import make_direction_labels
 from core.profiles import get_profile, list_profiles
+from core.pattern_memory import PatternMemory, MemoryGate
+from core.scalers import Scaler
 from data.btc_data_loader import load_btc_csv
+
+
+def _check_gpu_available() -> bool:
+    """Check if GPU is available and accessible for RAPIDS/cuML."""
+    try:
+        import cudf
+        # Try a simple operation to verify GPU context
+        test_df = cudf.DataFrame({'test': [1, 2, 3]})
+        _ = len(test_df)
+        return True
+    except Exception:
+        return False
+
+
+def _collect_runtime_env() -> dict:
+    return {
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+        "gpu_env": collect_gpu_env(),
+    }
+
+
+def _print_env_summary(runtime_env: dict) -> None:
+    conda_env = runtime_env.get("conda_env") or "n/a"
+    print(f"[Env] Python {runtime_env.get('python')} | Conda env: {conda_env}")
+    gpu_env = runtime_env.get("gpu_env") or {}
+    if gpu_env:
+        versions = ", ".join(f"{key}={value}" for key, value in gpu_env.items())
+        print(f"[Env] GPU stack: {versions}")
+
+
+def _data_signature(data_path: Path | None, df: pd.DataFrame) -> dict:
+    if data_path and data_path.exists():
+        stat = data_path.stat()
+        return {
+            "path": str(data_path),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+        }
+    return {
+        "rows": len(df),
+        "start": str(df.index.min()) if not df.empty else None,
+        "end": str(df.index.max()) if not df.empty else None,
+    }
+
+
+def _build_feature_cache_metadata(
+    data_path: Path | None,
+    df: pd.DataFrame,
+    feature_store: FeatureStore,
+    recent: int | None,
+    recent_warmup: int | None,
+) -> dict:
+    include_patterns = [
+        pattern.pattern for pattern in (feature_store.include_feature_patterns or [])
+    ]
+    exclude_patterns = [
+        pattern.pattern for pattern in (feature_store.exclude_feature_patterns or [])
+    ]
+    return {
+        "data_signature": _data_signature(data_path, df),
+        "featurestore": {
+            "safe_mode": feature_store.safe_mode,
+            "use_gpu": feature_store.use_gpu,
+            "chunk_size": feature_store.chunk_size,
+            "disable_ml_features": feature_store.disable_ml_features,
+            "disable_regime_context": feature_store.disable_regime_context_flag,
+            "disable_signal_dynamics": feature_store.disable_signal_dynamics_flag,
+            "disable_rolling_stats": feature_store.disable_rolling_stats_flag,
+            "disable_modules": sorted(feature_store.disable_modules),
+            "include_modules": sorted(feature_store.include_modules),
+            "include_features": include_patterns,
+            "exclude_features": exclude_patterns,
+        },
+        "recent": recent,
+        "recent_warmup": recent_warmup,
+    }
+
+
+def _feature_cache_matches(current: dict, cached: dict) -> bool:
+    return current == cached
+
+
+def _load_cache_metadata(metadata_path: Path) -> dict | None:
+    if not metadata_path.exists():
+        return None
+    try:
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def _write_cache_metadata(metadata_path: Path, metadata: dict) -> None:
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
 
 
 def compute_sharpe(returns: pd.Series, periods_per_year: int = 2190) -> float:
@@ -289,6 +393,8 @@ def main():
     # Parse CLI arguments
     parser = argparse.ArgumentParser(description='Backtest trained models')
     parser.add_argument('--recent', type=int, default=None, help='Only use last N bars for backtest')
+    parser.add_argument('--recent-warmup', type=int, default=1000,
+                        help='Warmup bars to include before --recent for indicators (default: 1000)')
     parser.add_argument('--p', type=float, default=None,
                         help='Probability threshold for DirectionBlender trades (overrides default, applies to both long and short)')
     parser.add_argument('--p-long', '--p_long', type=float, default=None, dest='p_long',
@@ -316,12 +422,28 @@ def main():
     parser.add_argument('--dump-ev-analysis', action='store_true',
                         help='Dump EV diagnostics, plots, and tables to results/')
     parser.add_argument('--use-cuml', action='store_true',
-                        help='Enable cuML/cuDF GPU models (requires RAPIDS; fails if unavailable)')
+                        help='Explicitly enable cuML/cuDF GPU models (default: auto-detect)')
+    parser.add_argument('--cpu-only', action='store_true',
+                        help='Force CPU mode (disable GPU even if available)')
+    parser.add_argument('--featurestore-gpu', action='store_true',
+                        help='Force GPU feature engineering (FeatureStore) when available')
+    parser.add_argument('--featurestore-cpu', action='store_true',
+                        help='Force CPU feature engineering (FeatureStore), even if GPU is available')
+    parser.add_argument('--feature-cache', type=str, default=None,
+                        help='Path to feature cache parquet file (default: models/cached_features.parquet)')
+    parser.add_argument('--recompute-feature-cache', action='store_true',
+                        help='Force recompute feature cache even if it exists')
     parser.add_argument('--chunk-size', type=int, default=100000,
                         help='Chunk size for GPU processing (default: 100000, reduce to 50000 if OOM)')
     parser.add_argument('--runpod', action='store_true',
                         help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
+    parser.add_argument('--pattern-memory', action='store_true',
+                        help='Enable PatternMemory: load memory table and add mem_* features (default: off)')
+    parser.add_argument('--memory-gate', action='store_true',
+                        help='Enable MemoryGate: apply veto/penalty to signals (default: off)')
     args = parser.parse_args()
+    runtime_env = _collect_runtime_env()
+    _print_env_summary(runtime_env)
     
     # Load profile if specified (STRICT: exit if not found)
     profile = None
@@ -387,6 +509,8 @@ def main():
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
+    if args.feature_cache is None:
+        args.feature_cache = str(models_dir / "cached_features.parquet")
 
     # 1. Load raw BTC CSV
     print("Loading BTC data...")
@@ -396,11 +520,14 @@ def main():
     test_2025_path = data_dir / "btcusd_5min_test_2025.csv"
     
     df_full = None
+    data_path = None
     if test_path.exists():
         df_full = load_btc_csv(str(test_path))
+        data_path = test_path
         print(f"Loaded test set: {len(df_full)} bars from {test_path}")
     elif test_2025_path.exists():
         df_full = load_btc_csv(str(test_2025_path))
+        data_path = test_2025_path
         print(f"Loaded test set: {len(df_full)} bars from {test_2025_path}")
     else:
         # Fall back to single file
@@ -414,6 +541,7 @@ def main():
         for path in csv_paths:
             if Path(path).exists():
                 df_full = load_btc_csv(str(path))
+                data_path = path
                 print(f"Loaded {len(df_full)} bars from {path}")
                 break
 
@@ -422,18 +550,45 @@ def main():
             csv_files = list(data_dir.glob("*.csv"))
             if csv_files:
                 df_full = load_btc_csv(str(csv_files[0]))
+                data_path = csv_files[0]
                 print(f"Loaded {len(df_full)} bars from {csv_files[0]}")
             else:
                 raise FileNotFoundError("No BTC CSV file found in data/ directory")
+
+    if args.recent is not None and args.recent > 0:
+        warmup = max(0, args.recent_warmup or 0)
+        total_bars = args.recent + warmup
+        if total_bars < len(df_full):
+            df_full = df_full.iloc[-total_bars:]
+            print(f"Trimmed to last {total_bars} bars ({args.recent} recent + {warmup} warmup)")
     
     # 2. Build features with FeatureStore (same settings as train.py)
-    use_cuml = args.use_cuml
-    if use_cuml:
-        print("[GPU] cuML requested via --use-cuml")
+    # Auto-detect GPU by default, unless --cpu-only is specified
+    if args.cpu_only:
+        use_cuml = False
+        print("[CPU] sklearn backend active (--cpu-only specified)")
+    elif args.use_cuml:
+        use_cuml = True
+        print("[GPU] cuML explicitly enabled via --use-cuml")
     else:
-        print("[CPU] sklearn backend active (no --use-cuml)")
+        # Auto-detect GPU availability
+        use_cuml = _check_gpu_available()
+        if use_cuml:
+            print("[GPU] cuML auto-detected and enabled")
+        else:
+            print("[CPU] sklearn backend active (GPU not available or RAPIDS not installed)")
 
-    feature_store_use_gpu = False
+    feature_store_use_gpu = use_cuml
+    if args.featurestore_gpu and args.featurestore_cpu:
+        print("[FeatureStore] Both --featurestore-gpu and --featurestore-cpu set; using CPU mode")
+        feature_store_use_gpu = False
+    elif args.featurestore_gpu:
+        feature_store_use_gpu = True
+    elif args.featurestore_cpu:
+        feature_store_use_gpu = False
+    if args.cpu_only and feature_store_use_gpu:
+        print("[FeatureStore] cpu_only flag set: forcing CPU feature engineering")
+        feature_store_use_gpu = False
     print(f"\nBuilding feature store... (GPU: {feature_store_use_gpu}, chunk_size: {args.chunk_size})")
     feature_store = FeatureStore(
         safe_mode=True,
@@ -445,8 +600,69 @@ def main():
     signal_modules = feature_store.signal_modules
     context_modules = feature_store.context_modules
     
-    features_full = feature_store.build(df_full)
-    print(f"Built {features_full.shape[1]} features for {len(features_full)} bars")
+    feature_cache_path = Path(args.feature_cache) if args.feature_cache else None
+    features_full = None
+    if feature_cache_path is not None:
+        metadata_path = feature_cache_path.with_suffix(feature_cache_path.suffix + ".meta.json")
+        current_metadata = _build_feature_cache_metadata(
+            data_path=data_path,
+            df=df_full,
+            feature_store=feature_store,
+            recent=args.recent,
+            recent_warmup=args.recent_warmup,
+        )
+        cached_metadata = _load_cache_metadata(metadata_path)
+        cache_valid = (
+            feature_cache_path.exists()
+            and cached_metadata is not None
+            and _feature_cache_matches(current_metadata, cached_metadata)
+            and not args.recompute_feature_cache
+        )
+        if cache_valid:
+            features_full = feature_store.load_cached(feature_cache_path)
+            print(f"[Features] Loaded cached features: {features_full.shape}")
+        else:
+            if args.recompute_feature_cache:
+                print("[Features] Recomputing feature cache (explicit flag set)")
+            elif cached_metadata is None:
+                print("[Features] Feature cache metadata missing; rebuilding cache")
+            else:
+                print("[Features] Feature cache metadata mismatch; rebuilding cache")
+            features_full = feature_store.build_and_cache(
+                df_full,
+                signal_modules=signal_modules,
+                context_modules=context_modules,
+                cache_path=feature_cache_path,
+                force_recompute=True,
+            )
+            print(f"[Features] Built {features_full.shape[1]} features for {len(features_full)} bars")
+            _write_cache_metadata(metadata_path, current_metadata)
+            print(f"[Features] Cached features to {feature_cache_path}")
+    else:
+        features_full = feature_store.build_features(df_full, signal_modules, context_modules)
+        features_full = feature_store.clean_features(features_full)
+        print(f"Built {features_full.shape[1]} features for {len(features_full)} bars")
+    
+    # Add PatternMemory features if enabled (before scaling)
+    pattern_memory = None
+    mem_features_full = None
+    if args.pattern_memory:
+        pattern_memory_path = models_dir / "pattern_memory"
+        if pattern_memory_path.parent.exists():
+            pattern_memory = PatternMemory()
+            try:
+                pattern_memory.load(pattern_memory_path)
+                print(f"[PatternMemory] Loaded memory table with {len(pattern_memory.memory_table)} keys")
+                # Add mem_* features (will be added back after scaling)
+                mem_features_full = pattern_memory.transform(features_full, df_full)
+                print(f"[PatternMemory] Generated {len(mem_features_full.columns)} mem_* features")
+            except Exception as e:
+                print(f"[PatternMemory] Warning: Could not load memory: {e}")
+                pattern_memory = None
+                mem_features_full = None
+        else:
+            print(f"[PatternMemory] Warning: Memory artifact not found at {pattern_memory_path}, skipping")
+    
     # Print final feature columns to verify parity with training
     print("\nFINAL FEATURE COLUMNS:", features_full.columns.tolist())
     
@@ -547,20 +763,52 @@ def main():
     
     final_signal_gen_kwargs['calibration_csv_path'] = calibration_csv
     
+    # Add MemoryGate if enabled
+    final_signal_gen_kwargs['enable_memory_gate'] = args.memory_gate
+    
     final_signal_gen = FinalSignalGenerator(**final_signal_gen_kwargs)
+    
+    # Load scaler for feature scaling (mem_* features should NOT be scaled)
+    scaler_path = models_dir / "feature_scaler.pkl"
+    if not scaler_path.exists():
+        raise FileNotFoundError(f"Scaler not found: {scaler_path}")
+    scaler = Scaler.load(str(scaler_path))
+    print(f"Loaded scaler from {scaler_path}")
     
     # 4. Slice data if --recent is specified
     if args.recent is not None and args.recent > 0:
         df = df_full.iloc[-args.recent:]
         features = features_full.loc[df.index]
+        if mem_features_full is not None:
+            mem_features = mem_features_full.loc[df.index]
+        else:
+            mem_features = None
         print(f"\nUsing last {args.recent} bars for backtest")
     else:
         df = df_full
         features = features_full
+        mem_features = mem_features_full
+    
+    # Scale features (excluding mem_* if present)
+    # Scaler only scales columns it was fitted on (from training)
+    # mem_* columns are not in the scaler, so they'll be ignored if passed
+    if mem_features is not None:
+        # Separate mem_* from regular features for clarity
+        mem_cols = list(mem_features.columns)
+        feature_cols = [col for col in features.columns if col not in mem_cols]
+        # Scale only regular features (scaler will ignore mem_* if accidentally included)
+        features_scaled = scaler.transform(features[feature_cols])
+        # Re-add mem_* features (unscaled, already normalized)
+        features_scaled = pd.concat([features_scaled, mem_features], axis=1)
+    else:
+        features_scaled = scaler.transform(features)
     
     # 5. Generate final signals with regime-aware ensemble
     print("\nGenerating final signals with regime-aware ensemble...")
-    signals, ev_series = final_signal_gen.predict(features=features, df=df)
+    signals, ev_series = final_signal_gen.predict(features=features_scaled, df=df)
+    
+    # MemoryGate is applied inside FinalSignalGenerator.predict() if enable_memory_gate=True
+    # (features_scaled already includes mem_* columns for the gate)
     
     # Capture direction confidence for calibration
     direction_confidence = final_signal_gen.direction_confidence.reindex(signals.index).fillna(0.0)
@@ -1184,4 +1432,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

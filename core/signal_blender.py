@@ -6,6 +6,66 @@ import pickle
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
+from core.gpu_env import collect_gpu_env, diff_gpu_env
+
+
+def _patch_cuml_for_pickle_load():
+    """
+    Patch cuML's __setstate__ to handle version compatibility issues.
+    Some cuML versions have missing attributes like 'verbose' when loading older models.
+    Returns the original __setstate__ method to restore later.
+    """
+    original_setstate = None
+    try:
+        from cuml.ensemble import RandomForestClassifier
+        if hasattr(RandomForestClassifier, '__setstate__'):
+            original_setstate = RandomForestClassifier.__setstate__
+            
+            def patched_setstate(self, state):
+                # Add missing attributes if not present (common in version mismatches)
+                if isinstance(state, dict):
+                    # Common missing attributes in cuML version mismatches
+                    if 'verbose' not in state:
+                        state['verbose'] = False
+                    
+                    # n_cols and n_rows are critical - try to infer or provide defaults
+                    # Note: These may not work if the model structure changed significantly
+                    if 'n_cols' not in state:
+                        # Try to infer from other fields, or use a safe default
+                        # The model might be able to reconstruct from tree data
+                        state['n_cols'] = state.get('n_features', state.get('num_features', 1))
+                    
+                    if 'n_rows' not in state:
+                        state['n_rows'] = state.get('n_samples', 0)
+                # Call original setstate - if it fails, the outer try/except will catch it
+                if original_setstate:
+                    try:
+                        return original_setstate(self, state)
+                    except KeyError as ke:
+                        # Re-raise with more context
+                        missing_key = str(ke).strip("'\"")
+                        raise KeyError(
+                            f"cuML version mismatch: Missing required attribute '{missing_key}'. "
+                            f"Model was saved with different cuML version. "
+                            f"Use --cpu-only flag or retrain the model."
+                        ) from ke
+            
+            RandomForestClassifier.__setstate__ = patched_setstate
+    except ImportError:
+        pass  # cuML not available, will use sklearn
+    
+    return original_setstate
+
+
+def _restore_cuml_setstate(original_setstate):
+    """Restore original cuML __setstate__ after patching."""
+    if original_setstate is not None:
+        try:
+            from cuml.ensemble import RandomForestClassifier
+            RandomForestClassifier.__setstate__ = original_setstate
+        except:
+            pass
+
 
 # Calibration support
 try:
@@ -581,6 +641,7 @@ class SignalBlender(BlenderBase):
             'signal_classes': self.signal_classes,
             'feature_names': self.feature_names,
             'use_gpu': self.use_gpu,  # Store GPU mode preference
+            'gpu_env': collect_gpu_env(),
             'calibration_method': self.calibration_method,
             'calibrators': self.calibrators if self.calibrators else {},
             'sharpening_alpha': self.sharpening_alpha,
@@ -604,8 +665,23 @@ class SignalBlender(BlenderBase):
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
         
-        with open(path, 'rb') as f:
-            model_data = pickle.load(f)
+        # Patch cuML for version compatibility
+        original_setstate = _patch_cuml_for_pickle_load()
+        
+        try:
+            with open(path, 'rb') as f:
+                model_data = pickle.load(f)
+        except (KeyError, AttributeError) as e:
+            error_msg = str(e)
+            if 'verbose' in error_msg or 'KeyError' in str(type(e).__name__):
+                raise RuntimeError(
+                    f"cuML version mismatch: Model was saved with different cuML version.\n"
+                    f"Error: {e}\n"
+                    f"Solution: Use --cpu-only flag to force CPU mode, or retrain the model."
+                ) from e
+            raise
+        finally:
+            _restore_cuml_setstate(original_setstate)
         
         self.model = model_data['model']
         self.model_params = model_data.get('model_params', {})
@@ -613,6 +689,20 @@ class SignalBlender(BlenderBase):
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
+        saved_gpu_env = model_data.get('gpu_env')
+        current_gpu_env = collect_gpu_env()
+        is_cuml_model = hasattr(self.model, '__class__') and 'cuml' in str(type(self.model))
+        mismatches = diff_gpu_env(saved_gpu_env, current_gpu_env)
+        if saved_use_gpu and is_cuml_model and mismatches:
+            mismatch_details = ", ".join(
+                f"{key}: saved={vals['saved']} current={vals['current']}"
+                for key, vals in mismatches.items()
+            )
+            raise RuntimeError(
+                "cuML version mismatch: Model was saved with a different GPU stack.\n"
+                f"Details: {mismatch_details}\n"
+                "Fix: match cuML/cuDF/CUDA versions or retrain the model."
+            )
         if saved_use_gpu and self.use_gpu:
             try:
                 self._cudf, self._cuRFClassifier = self._require_cuml()
@@ -1031,6 +1121,7 @@ class DirectionBlender(BlenderBase):
             'direction_classes': self.direction_classes,
             'feature_names': self.feature_names,
             'use_gpu': self.use_gpu,  # Store GPU mode preference
+            'gpu_env': collect_gpu_env(),
             'calibration_method': self.calibration_method,
             'calibrators': self.calibrators if self.calibrators else {},
             'sharpening_alpha': self.sharpening_alpha,
@@ -1054,8 +1145,23 @@ class DirectionBlender(BlenderBase):
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
         
-        with open(path, 'rb') as f:
-            model_data = pickle.load(f)
+        # Patch cuML for version compatibility
+        original_setstate = _patch_cuml_for_pickle_load()
+        
+        try:
+            with open(path, 'rb') as f:
+                model_data = pickle.load(f)
+        except (KeyError, AttributeError) as e:
+            error_msg = str(e)
+            if 'verbose' in error_msg or 'KeyError' in str(type(e).__name__):
+                raise RuntimeError(
+                    f"cuML version mismatch: Model was saved with different cuML version.\n"
+                    f"Error: {e}\n"
+                    f"Solution: Use --cpu-only flag to force CPU mode, or retrain the model."
+                ) from e
+            raise
+        finally:
+            _restore_cuml_setstate(original_setstate)
         
         self.model = model_data['model']
         self.model_params = model_data.get('model_params', {})
@@ -1063,6 +1169,20 @@ class DirectionBlender(BlenderBase):
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
+        saved_gpu_env = model_data.get('gpu_env')
+        current_gpu_env = collect_gpu_env()
+        is_cuml_model = hasattr(self.model, '__class__') and 'cuml' in str(type(self.model))
+        mismatches = diff_gpu_env(saved_gpu_env, current_gpu_env)
+        if saved_use_gpu and is_cuml_model and mismatches:
+            mismatch_details = ", ".join(
+                f"{key}: saved={vals['saved']} current={vals['current']}"
+                for key, vals in mismatches.items()
+            )
+            raise RuntimeError(
+                "cuML version mismatch: Model was saved with a different GPU stack.\n"
+                f"Details: {mismatch_details}\n"
+                "Fix: match cuML/cuDF/CUDA versions or retrain the model."
+            )
         if saved_use_gpu and self.use_gpu:
             self._cudf, self._cuRFClassifier = self._require_cuml()
             print("[GPU] cuML enabled for DirectionBlender (loaded)")

@@ -21,6 +21,7 @@ from typing import List, Tuple, Dict, Optional
 import pandas as pd
 import numpy as np
 from sklearn.metrics import accuracy_score, confusion_matrix
+from core.gpu_env import collect_gpu_env
 
 
 class TrainingHeartbeat:
@@ -176,6 +177,24 @@ def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, default=_json_default)
+
+
+def _collect_runtime_env() -> Dict[str, object]:
+    return {
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "conda_env": os.environ.get("CONDA_DEFAULT_ENV"),
+        "gpu_env": collect_gpu_env(),
+    }
+
+
+def _print_env_summary(runtime_env: Dict[str, object]) -> None:
+    conda_env = runtime_env.get("conda_env") or "n/a"
+    print(f"[Env] Python {runtime_env.get('python')} | Conda env: {conda_env}")
+    gpu_env = runtime_env.get("gpu_env") or {}
+    if gpu_env:
+        versions = ", ".join(f"{key}={value}" for key, value in gpu_env.items())
+        print(f"[Env] GPU stack: {versions}")
 
 
 def set_global_seed(seed: int) -> None:
@@ -502,6 +521,7 @@ from core.feature_store import FeatureStore, get_gpu_memory_info
 from core.regime_detector import RegimeDetector, wilder_atr
 from core.signal_blender import SignalBlender, DirectionBlender
 from core.labeling import make_direction_labels, make_regime_labels
+from core.pattern_memory import PatternMemory, MemoryGate
 from core.scalers import ZScoreScaler, MinMaxScaler, RobustScaler
 from core.training_utils import (
     prune_features_by_importance,
@@ -678,6 +698,35 @@ def _apply_purge_and_embargo(
     return adjusted, purge_delta, embargo_delta
 
 
+def _is_cuda_error(e: Exception) -> bool:
+    """Check if exception is a CUDA/GPU context error."""
+    error_str = str(e)
+    error_type = type(e).__name__
+    cuda_error_indicators = [
+        'CUDA_ERROR_NO_DEVICE',
+        'CUDA_ERROR',
+        'CudaSupportError',
+        'CudaAPIError',
+        'cuInit',
+        'no device',
+        'cuda',
+    ]
+    return any(indicator.lower() in error_str.lower() or indicator.lower() in error_type.lower() 
+               for indicator in cuda_error_indicators)
+
+
+def _check_gpu_available() -> bool:
+    """Check if GPU is still available and accessible."""
+    try:
+        import cudf
+        # Try a simple operation to verify GPU context
+        test_df = cudf.DataFrame({'test': [1, 2, 3]})
+        _ = len(test_df)
+        return True
+    except Exception:
+        return False
+
+
 def _check_gpu_memory_safe_for_preload(features: pd.DataFrame, use_gpu: bool, max_usage_ratio: float = 0.5) -> bool:
     """
     Check if GPU has enough memory to safely pre-load the full feature DataFrame.
@@ -747,7 +796,8 @@ def train_one_window(
     disable_calibration: bool = False,
     X_val: Optional[pd.DataFrame] = None,
     y_val: Optional[pd.Series] = None,
-    calibration_source: str = "train"
+    calibration_source: str = "train",
+    pattern_memory: Optional[PatternMemory] = None,
 ) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict, Dict]:
     """
     Train regime detector, signal blender, direction blender, and regime-specific models on a training window.
@@ -1126,6 +1176,8 @@ def slice_window(
     """
     Slice cached features and raw data for a time window, enforcing alignment.
     Supports both pandas and cuDF DataFrames for features.
+    
+    If GPU context is lost (CUDA_ERROR_NO_DEVICE), automatically falls back to pandas.
 
     Labels always derive from the raw df slice; models see the cached features
     on the exact same index. Any divergence is a correctness bug and must fail
@@ -1139,10 +1191,19 @@ def slice_window(
         start_naive = start_ts.tz_localize(None) if start_ts.tzinfo else start_ts
         end_naive = end_ts.tz_localize(None) if end_ts.tzinfo else end_ts
         
-        # Slice cuDF DataFrame with timezone-naive timestamps
-        feats_window = features[(features.index >= start_naive) & (features.index < end_naive)]
-        # Convert to pandas for compatibility with rest of pipeline
-        feats_window = feats_window.to_pandas()
+        try:
+            # Slice cuDF DataFrame with timezone-naive timestamps
+            feats_window = features[(features.index >= start_naive) & (features.index < end_naive)]
+            # Convert to pandas for compatibility with rest of pipeline
+            feats_window = feats_window.to_pandas()
+        except Exception as e:
+            # If CUDA error, signal to caller to convert to pandas
+            if _is_cuda_error(e):
+                # Raise special exception that caller will catch and handle
+                raise RuntimeError("GPU_CONTEXT_LOST") from e
+            else:
+                # Re-raise non-CUDA errors
+                raise
     else:
         # Slice pandas DataFrame (existing logic)
         feats_window = features[(features.index >= start_ts) & (features.index < end_ts)].copy()
@@ -1202,6 +1263,7 @@ def train_models_for_window(
     X_val: Optional[pd.DataFrame] = None,
     y_val: Optional[pd.Series] = None,
     calibration_source: str = "train",
+    pattern_memory: Optional[PatternMemory] = None,
 ) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict, Dict]:
     """Thin wrapper to make the training stage signature explicit."""
     return train_one_window(
@@ -1226,6 +1288,7 @@ def train_models_for_window(
         X_val=X_val,
         y_val=y_val,
         calibration_source=calibration_source,
+        pattern_memory=pattern_memory,
     )
 
 
@@ -1280,6 +1343,7 @@ def combined_training(
     regime_label_strategy: str = "indicator",
     smoothing_window: int = 12,
     use_gpu: bool = False,
+    featurestore_use_gpu: Optional[bool] = None,
     random_state: Optional[int] = None,
     calibration_method: Optional[str] = None,
     sharpening_alpha: float = 2.0,
@@ -1300,6 +1364,8 @@ def combined_training(
     include_modules: Optional[List[str]] = None,
     include_features: Optional[List[str]] = None,
     exclude_features: Optional[List[str]] = None,
+    # PatternMemory
+    enable_pattern_memory: bool = False,
 ) -> Tuple[RegimeDetector, SignalBlender, Optional[DirectionBlender], Dict]:
     """
     Perform walk-forward training across all windows.
@@ -1322,6 +1388,7 @@ def combined_training(
         regime_label_strategy: Regime label strategy ("indicator" or "rule")
         smoothing_window: Smoothing window for direction labels
         use_gpu: Whether to use GPU acceleration for models
+        featurestore_use_gpu: Whether to use GPU acceleration for feature engineering
         random_state: Random seed for model initialization
         calibration_method: Calibration method for SignalBlender
         sharpening_alpha: Sharpening alpha for calibrated probabilities
@@ -1342,13 +1409,14 @@ def combined_training(
     """
     # Force a single feature build to avoid O(N x windows) recomputation costs.
     cache_path = feature_cache_path or (models_dir / "cached_features.parquet")
+    effective_featurestore_gpu = use_gpu if featurestore_use_gpu is None else featurestore_use_gpu
     feature_store, cached_features = build_features_once(
         df,
         signal_modules,
         context_modules,
         cache_path,
         force_recompute=force_recompute_cache,
-        use_gpu=False,
+        use_gpu=effective_featurestore_gpu,
         disable_ml_features=disable_ml_features,
         disable_regime_context=disable_regime_context,
         disable_signal_dynamics=disable_signal_dynamics,
@@ -1421,6 +1489,12 @@ def combined_training(
     heartbeat = TrainingHeartbeat(interval_seconds=30)
     heartbeat.start(total_windows=len(splits))
     
+    # Initialize PatternMemory if enabled
+    pattern_memory = None
+    if enable_pattern_memory:
+        pattern_memory = PatternMemory(horizon_bars=horizon_bars)
+        print("[PatternMemory] PatternMemory enabled - will build from first window's train slice")
+    
     # Walk-forward training
     for i, (train_start, train_end, val_start, val_end) in enumerate(splits, 1):
         heartbeat.update(window=i, step="starting window")
@@ -1450,20 +1524,139 @@ def combined_training(
         
         # Extract windows using cached feature index to prevent any recomputation
         # Use GPU features if available, otherwise fallback to pandas
+        # Check GPU availability before using cuDF (WSL can lose GPU context)
+        if cached_features_gpu is not None and not _check_gpu_available():
+            print(f"[GPU] GPU no longer available at window {i}, converting to pandas...")
+            sys.stdout.flush()
+            try:
+                # Convert cuDF to pandas
+                cached_features_gpu = cached_features_gpu.to_pandas()
+                cached_features_gpu = None  # Clear GPU reference
+            except Exception as convert_e:
+                print(f"[GPU] Could not convert cuDF to pandas: {convert_e}, using original pandas")
+                cached_features_gpu = None
+        
         try:
             features_to_slice = cached_features_gpu if cached_features_gpu is not None else cached_features
             df_train, feats_train = slice_window(df, features_to_slice, train_start, train_end)
             df_val, feats_val = slice_window(df, features_to_slice, val_start, val_end)
+        except RuntimeError as e:
+            # GPU context lost during slicing - convert to pandas and retry
+            if "GPU_CONTEXT_LOST" in str(e):
+                print(f"[GPU] GPU context lost during slicing at window {i}, converting to pandas and retrying...")
+                sys.stdout.flush()
+                try:
+                    # Convert cuDF to pandas if we still have it
+                    if cached_features_gpu is not None:
+                        try:
+                            cached_features = cached_features_gpu.to_pandas()
+                        except Exception:
+                            pass  # Already converted or failed, use original
+                    cached_features_gpu = None
+                    features_to_slice = cached_features
+                    df_train, feats_train = slice_window(df, features_to_slice, train_start, train_end)
+                    df_val, feats_val = slice_window(df, features_to_slice, val_start, val_end)
+                    print(f"[GPU] Successfully switched to CPU mode for remaining windows")
+                    sys.stdout.flush()
+                except Exception as retry_e:
+                    print(f"Warning: Skipping window {i} due to error after GPU fallback: {retry_e}")
+                    print(f"Full traceback:\n{traceback.format_exc()}")
+                    sys.stdout.flush()
+                    continue
+            else:
+                raise
         except (ValueError, Exception) as e:
-            print(f"Warning: Skipping window {i} due to error: {e}")
-            print(f"Full traceback:\n{traceback.format_exc()}")
-            sys.stdout.flush()
-            continue
+            # Check if it's a CUDA error that we should handle
+            if _is_cuda_error(e):
+                print(f"[GPU] CUDA error at window {i}, converting to pandas and retrying...")
+                sys.stdout.flush()
+                try:
+                    # Convert cuDF to pandas if we still have it
+                    if cached_features_gpu is not None:
+                        try:
+                            cached_features = cached_features_gpu.to_pandas()
+                        except Exception:
+                            pass  # Already converted or failed, use original
+                    cached_features_gpu = None
+                    features_to_slice = cached_features
+                    df_train, feats_train = slice_window(df, features_to_slice, train_start, train_end)
+                    df_val, feats_val = slice_window(df, features_to_slice, val_start, val_end)
+                    print(f"[GPU] Successfully switched to CPU mode for remaining windows")
+                    sys.stdout.flush()
+                except Exception as retry_e:
+                    print(f"Warning: Skipping window {i} due to error after GPU fallback: {retry_e}")
+                    print(f"Full traceback:\n{traceback.format_exc()}")
+                    sys.stdout.flush()
+                    continue
+            else:
+                print(f"Warning: Skipping window {i} due to error: {e}")
+                print(f"Full traceback:\n{traceback.format_exc()}")
+                sys.stdout.flush()
+                continue
 
         if len(df_train) == 0 or len(df_val) == 0:
             print(f"Warning: Skipping window {i} - insufficient data")
             sys.stdout.flush()
             continue
+
+        # Build PatternMemory from first window's train slice (if enabled and not yet built)
+        if enable_pattern_memory and pattern_memory is not None and not pattern_memory.is_built:
+            print("[PatternMemory] Building memory table from first window's train slice...")
+            # Need full features (with MLFeatures) for memory build
+            # Build full features for this train slice
+            feature_store_full = FeatureStore(
+                use_gpu=effective_featurestore_gpu,
+                disable_ml_features=False,  # Need MLFeatures for key
+                disable_regime_context=disable_regime_context,
+                disable_signal_dynamics=disable_signal_dynamics,
+                disable_rolling_stats=disable_rolling_stats,
+            )
+            feats_train_full = feature_store_full.build(df_train)
+            
+            # Generate labels for memory build
+            df_labeled_train = make_direction_labels(
+                df_train,
+                horizon_bars=horizon_bars,
+                label_threshold=label_threshold,
+                smoothing_window=smoothing_window,
+                cost_bps_per_side=transaction_cost_bps,
+                cost_adjusted=cost_adjusted_labels,
+                debug=False
+            )
+            blend_y_train = df_labeled_train['blend_label'].reindex(feats_train_full.index).fillna(0).astype(int)
+            
+            # Build memory
+            pattern_memory.build(feats_train_full, df_train, label_series=blend_y_train)
+            
+            # Save memory artifact
+            pattern_memory.save(models_dir / "pattern_memory")
+            print(f"[PatternMemory] Memory built and saved to {models_dir / 'pattern_memory'}")
+        
+        # Add mem_* features to train/val features if PatternMemory is enabled
+        if enable_pattern_memory and pattern_memory is not None and pattern_memory.is_built:
+            # Need full features (with MLFeatures) for key computation
+            # Build full features for train/val slices
+            feature_store_full = FeatureStore(
+                use_gpu=effective_featurestore_gpu,
+                disable_ml_features=False,  # Need MLFeatures for key
+                disable_regime_context=disable_regime_context,
+                disable_signal_dynamics=disable_signal_dynamics,
+                disable_rolling_stats=disable_rolling_stats,
+            )
+            feats_train_full = feature_store_full.build(df_train)
+            feats_val_full = feature_store_full.build(df_val)
+            
+            # Add mem_* features
+            mem_train = pattern_memory.transform(feats_train_full, df_train)
+            mem_val = pattern_memory.transform(feats_val_full, df_val)
+            
+            # Merge mem_* into cached features (align on index)
+            # Ensure index alignment before concat
+            mem_train = mem_train.reindex(feats_train.index, fill_value=0.0)
+            mem_val = mem_val.reindex(feats_val.index, fill_value=0.0)
+            feats_train = pd.concat([feats_train, mem_train], axis=1)
+            feats_val = pd.concat([feats_val, mem_val], axis=1)
+            print(f"[PatternMemory] Added mem_* features to train ({len(mem_train.columns)} columns) and val")
 
         # Train on window using cached features to prevent repeated computation
         train_start_time = time.time()
@@ -1534,6 +1727,7 @@ def combined_training(
                 X_val=X_val_window,
                 y_val=y_val_window,
                 calibration_source=calibration_source,
+                pattern_memory=pattern_memory if enable_pattern_memory else None,
             )
             train_elapsed = time.time() - train_start_time
             print(f"  Training samples: {train_stats['train_samples']}")
@@ -2021,6 +2215,12 @@ def main():
                         help='Use RunPod workspace layout (/workspace/Hybridyzer) for data, models, and results')
     parser.add_argument('--cpu-only', action='store_true',
                         help='Force CPU even if cuML is installed')
+    parser.add_argument('--featurestore-gpu', action='store_true',
+                        help='Force GPU feature engineering (FeatureStore) when available')
+    parser.add_argument('--featurestore-cpu', action='store_true',
+                        help='Force CPU feature engineering (FeatureStore), even if GPU is available')
+    parser.add_argument('--recompute-feature-cache', action='store_true',
+                        help='Force recompute cached features even if cache exists')
     parser.add_argument('--walkforward', action='store_true',
                         help='Use walk-forward training instead of the single 80/20 split')
     parser.add_argument('--train-months', type=int, default=6,
@@ -2045,6 +2245,10 @@ def main():
                         help='Calibration data source for walk-forward: train (use training window) or val (use validation window) (default: train)')
     parser.add_argument('--log-file', type=str, default=None,
                         help='Path to log file (default: results/train.log)')
+    parser.add_argument('--pattern-memory', action='store_true',
+                        help='Enable PatternMemory: build memory table and add mem_* features (default: off)')
+    parser.add_argument('--no-pattern-memory', action='store_true',
+                        help='Explicitly disable PatternMemory (default: off)')
     args = parser.parse_args()
 
     # Configuration
@@ -2073,21 +2277,40 @@ def main():
     print(f"[Seed] Using random seed: {args.seed}")
     regime_label_strategy = args.regime_labels
     print(f"[Labels] Regime label strategy: {regime_label_strategy}")
+    runtime_env = _collect_runtime_env()
+    _print_env_summary(runtime_env)
     
     # GPU detection: check for cuML availability
     try:
         import cudf  # noqa: F401
         import cuml  # noqa: F401
-        gpu_available = True
+        # Check if GPU is actually accessible (not just installed)
+        gpu_available = _check_gpu_available()
     except ImportError:
         gpu_available = False
     
     if args.cpu_only:
         use_cuml = False
         print("[GPU] cpu_only flag set: forcing CPU backend")
+    elif gpu_available:
+        use_cuml = True
+        print("[GPU] cuML auto-detected and enabled")
     else:
-        use_cuml = gpu_available
-        print(f"[GPU] cuML available: {use_cuml}")
+        use_cuml = False
+        print("[CPU] sklearn backend active (GPU not available or RAPIDS not installed)")
+
+    featurestore_use_gpu = use_cuml
+    if args.featurestore_gpu and args.featurestore_cpu:
+        print("[FeatureStore] Both --featurestore-gpu and --featurestore-cpu set; using CPU mode")
+        featurestore_use_gpu = False
+    elif args.featurestore_gpu:
+        featurestore_use_gpu = True
+    elif args.featurestore_cpu:
+        featurestore_use_gpu = False
+    if args.cpu_only and featurestore_use_gpu:
+        print("[FeatureStore] cpu_only flag set: forcing CPU feature engineering")
+        featurestore_use_gpu = False
+    print(f"[FeatureStore] GPU enabled: {featurestore_use_gpu}")
     
     # Calibration settings - defaults to always calibrate
     if args.disable_calibration:
@@ -2282,10 +2505,15 @@ def main():
         for k, v in ablation_settings.items():
             if v:
                 print(f"  {k}: {v}")
+
+    force_recompute_cache = args.recompute_feature_cache
+    if force_recompute_cache:
+        print("[Features] Recomputing cached features (explicit flag set)")
     
     # 2. Build or load cached features once to avoid recomputation across runs
     cache_path = models_dir / "cached_features.parquet"
     feature_store = FeatureStore(
+        use_gpu=featurestore_use_gpu,
         disable_ml_features=args.disable_ml_features,
         disable_regime_context=args.disable_regime_context,
         disable_signal_dynamics=args.disable_signal_dynamics,
@@ -2300,7 +2528,8 @@ def main():
         signal_modules=feature_store.signal_modules,
         context_modules=feature_store.context_modules,
         cache_path=cache_path,
-        use_gpu=False,
+        use_gpu=featurestore_use_gpu,
+        force_recompute=force_recompute_cache,
         disable_ml_features=args.disable_ml_features,
         disable_regime_context=args.disable_regime_context,
         disable_signal_dynamics=args.disable_signal_dynamics,
@@ -2327,7 +2556,7 @@ def main():
             context_modules=feature_store.context_modules,
             models_dir=models_dir,
             feature_cache_path=cache_path,
-            force_recompute_cache=False,
+            force_recompute_cache=force_recompute_cache,
             train_months=args.train_months,
             val_months=args.val_months,
             slide_months=args.slide_months,
@@ -2338,6 +2567,7 @@ def main():
             regime_label_strategy=regime_label_strategy,
             smoothing_window=SMOOTHING_WINDOW,
             use_gpu=use_cuml,
+            featurestore_use_gpu=featurestore_use_gpu,
             random_state=args.seed,
             calibration_method=calibration_method,
             sharpening_alpha=sharpening_alpha,
@@ -2358,6 +2588,7 @@ def main():
             include_modules=include_modules_list,
             include_features=include_features_list,
             exclude_features=exclude_features_list,
+            enable_pattern_memory=args.pattern_memory and not args.no_pattern_memory,
         )
 
         # Save all models
@@ -2390,6 +2621,8 @@ def main():
             "run_type": "walkforward",
             "seed": args.seed,
             "use_gpu": use_cuml,
+            "featurestore_use_gpu": featurestore_use_gpu,
+            "runtime_env": runtime_env,
             "data_path": data_path,
             "feature_cache_path": cache_path,
             "log_path": log_path,
@@ -3217,6 +3450,8 @@ def main():
         "run_type": "static",
         "seed": args.seed,
         "use_gpu": use_cuml,
+        "featurestore_use_gpu": featurestore_use_gpu,
+        "runtime_env": runtime_env,
         "data_path": data_path,
         "feature_cache_path": cache_path,
         "log_path": log_path,

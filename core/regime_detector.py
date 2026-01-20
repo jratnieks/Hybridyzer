@@ -6,6 +6,7 @@ import pickle
 import sys
 from pathlib import Path
 from typing import Literal, Optional, Tuple
+from core.gpu_env import collect_gpu_env, diff_gpu_env
 
 
 RegimeType = Literal["trend_up", "trend_down", "chop"]
@@ -279,7 +280,8 @@ class RegimeDetector:
             'model_params': self.model_params,
             'regime_classes': self.regime_classes,
             'feature_names': self.feature_names,
-            'use_gpu': self.use_gpu  # Store GPU mode preference
+            'use_gpu': self.use_gpu,  # Store GPU mode preference
+            'gpu_env': collect_gpu_env()
         }
         
         with open(path, 'wb') as f:
@@ -299,8 +301,68 @@ class RegimeDetector:
         if not path.exists():
             raise FileNotFoundError(f"Model file not found: {path}")
         
-        with open(path, 'rb') as f:
-            model_data = pickle.load(f)
+        # Patch cuML's __setstate__ to handle version compatibility issues
+        # Some cuML versions have missing attributes like 'verbose' when loading older models
+        original_setstate = None
+        try:
+            from cuml.ensemble import RandomForestClassifier
+            if hasattr(RandomForestClassifier, '__setstate__'):
+                original_setstate = RandomForestClassifier.__setstate__
+                
+                def patched_setstate(self, state):
+                    # Add missing attributes if not present (common in version mismatches)
+                    if isinstance(state, dict):
+                        # Common missing attributes in cuML version mismatches
+                        if 'verbose' not in state:
+                            state['verbose'] = False
+                        
+                        # n_cols and n_rows are critical - try to infer or provide defaults
+                        # Note: These may not work if the model structure changed significantly
+                        if 'n_cols' not in state:
+                            # Try to infer from other fields, or use a safe default
+                            # The model might be able to reconstruct from tree data
+                            state['n_cols'] = state.get('n_features', state.get('num_features', 1))
+                        
+                        if 'n_rows' not in state:
+                            state['n_rows'] = state.get('n_samples', 0)
+                    # Call original setstate - if it fails, the outer try/except will catch it
+                    if original_setstate:
+                        try:
+                            return original_setstate(self, state)
+                        except KeyError as ke:
+                            # Re-raise with more context
+                            missing_key = str(ke).strip("'\"")
+                            raise KeyError(
+                                f"cuML version mismatch: Missing required attribute '{missing_key}'. "
+                                f"Model was saved with different cuML version. "
+                                f"Use --cpu-only flag or retrain the model."
+                            ) from ke
+                
+                RandomForestClassifier.__setstate__ = patched_setstate
+        except ImportError:
+            pass  # cuML not available, will use sklearn
+        
+        try:
+            with open(path, 'rb') as f:
+                model_data = pickle.load(f)
+        except (KeyError, AttributeError) as e:
+            # If patching didn't work, provide helpful error message
+            error_msg = str(e)
+            if 'KeyError' in str(type(e).__name__) or any(keyword in error_msg.lower() for keyword in ['verbose', 'n_cols', 'n_rows', 'cuml', 'version']):
+                raise RuntimeError(
+                    f"cuML version mismatch: Model was saved with different cuML version.\n"
+                    f"Error: {e}\n"
+                    f"Solution: Use --cpu-only flag to force CPU mode, or retrain the model."
+                ) from e
+            raise
+        finally:
+            # Restore original __setstate__ if we patched it
+            if original_setstate is not None:
+                try:
+                    from cuml.ensemble import RandomForestClassifier
+                    RandomForestClassifier.__setstate__ = original_setstate
+                except:
+                    pass
         
         self.model = model_data['model']
         self.model_params = model_data.get('model_params', {})
@@ -308,9 +370,35 @@ class RegimeDetector:
         self.feature_names = model_data.get('feature_names', [])
         # Restore GPU mode if model was trained on GPU (will auto-detect on next predict)
         saved_use_gpu = model_data.get('use_gpu', False)
-        if saved_use_gpu and self.use_gpu:
-            self._cudf, self._cuRFClassifier = self._require_cuml()
-            print(f"[GPU] cuML enabled for RegimeDetector (loaded)")
+        saved_gpu_env = model_data.get('gpu_env')
+        current_gpu_env = collect_gpu_env()
+        
+        # Check if model is a cuML model and if we can use GPU
+        is_cuml_model = hasattr(self.model, '__class__') and 'cuml' in str(type(self.model))
+        mismatches = diff_gpu_env(saved_gpu_env, current_gpu_env)
+        if saved_use_gpu and is_cuml_model and mismatches:
+            mismatch_details = ", ".join(
+                f"{key}: saved={vals['saved']} current={vals['current']}"
+                for key, vals in mismatches.items()
+            )
+            raise RuntimeError(
+                "cuML version mismatch: Model was saved with a different GPU stack.\n"
+                f"Details: {mismatch_details}\n"
+                "Fix: match cuML/cuDF/CUDA versions or retrain the model."
+            )
+        
+        if saved_use_gpu and self.use_gpu and is_cuml_model:
+            try:
+                # Try to enable GPU mode
+                self._cudf, self._cuRFClassifier = self._require_cuml()
+                # Test if model can be used (some cuML versions have compatibility issues)
+                # We'll catch errors during predict if needed
+                print(f"[GPU] cuML enabled for RegimeDetector (loaded)")
+            except (KeyError, AttributeError, Exception) as e:
+                # cuML version mismatch - fall back to CPU
+                print(f"[GPU] Warning: cuML model load failed ({type(e).__name__}: {e})")
+                print(f"[CPU] Falling back to CPU mode (cuML version compatibility issue)")
+                self.use_gpu = False
         else:
             if saved_use_gpu and not self.use_gpu:
                 print("[CPU] RegimeDetector trained on GPU, running with CPU backend per configuration")

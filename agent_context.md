@@ -1,7 +1,7 @@
 # Agent Context - Hybridyzer
 
 > Single source of truth for decisions, constraints, assumptions, and open questions.
-> Last updated: 2026-01-10
+> Last updated: 2026-01-19
 
 ---
 
@@ -60,6 +60,28 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - **Flags**: `--disable-ml-features`, `--disable-regime-context`, `--disable-signal-dynamics`, `--disable-rolling-stats`, `--disable-modules`, `--include-modules`
 - **Date**: 2026-01-07
 
+### D6: Cost-Adjusted Direction Labels
+- **Decision**: Add round-trip costs to the label threshold during training by default
+- **Rationale**: Prevents the model from learning edges smaller than taker+slippage
+- **Defaults**: `--taker-fee-bps=4.5`, `--slippage-bps=1.0`, `--no-cost-adjusted-labels` to disable
+- **Date**: 2026-01-16
+
+### D7: Backtest Cost Model (Entry/Exit)
+- **Decision**: Apply transaction costs only on position changes (entry/exit/flip), not per bar
+- **Rationale**: Costs must reflect trades, not every bar in position
+- **Date**: 2026-01-16
+
+### D8: Low-Confidence Trades
+- **Decision**: Disable low-confidence passthrough by default
+- **Rationale**: Prevents high-churn trading below main probability threshold
+- **Default**: `allow_low_confidence=False`
+- **Date**: 2026-01-16
+
+### D9: Deep-Train Option
+- **Decision**: Add `--deep-train` to increase model capacity for regime + blenders
+- **Rationale**: Optional higher-capacity models after cost-aware labels are in place
+- **Date**: 2026-01-16
+
 ---
 
 ## Constraints
@@ -73,14 +95,18 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 **RunPod (remote):**
 - CUDA 12, Python 3.10, RAPIDS 24.08
 - Use `environment.runpod.yml` for conda environment
+- Use `setup_runpod.sh` for automated setup
 - cuML/cuDF required for GPU training
+- Large VRAM (40-80GB) allows `--deep-train`
 
 **Local (WSL2 Ubuntu):**
 - WSL2 Ubuntu available with GPU passthrough
-- RTX 4070 (8GB VRAM) detected via `nvidia-smi`
-- CUDA 13.1 driver installed
-- Python 3.12.3 (system) - **Note:** RAPIDS requires Python 3.10-3.11
-- Conda env `hybridyzer` uses Python 3.10 with RAPIDS 24.08 (cuML/cuDF installed)
+- RTX 4070 Laptop (8GB VRAM) detected via `nvidia-smi`
+- CUDA 12.x driver installed
+- Use `environment.local.yml` for conda environment (`hybridyzer-local`)
+- Use `setup_local.sh` for automated setup
+- Python 3.10 (via conda) for RAPIDS compatibility
+- **Avoid `--deep-train`** on 8GB VRAM (may OOM)
 - Fallback: use `--cpu-only` with sklearn (works but slower)
 
 ### C3: Feature Count
@@ -97,8 +123,8 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - Adjust for other timeframes
 
 ### A2: Transaction Costs
-- Default `--fee-bps=1.0` (1 basis point per side)
-- Round-trip cost = 2 bps
+- Default taker fee `--taker-fee-bps=4.5` and slippage `--slippage-bps=1.0`
+- Round-trip cost = 11 bps (0.11%)
 
 ### A3: Regime Labels
 - `indicator` strategy uses `make_regime_labels()` (default)
@@ -136,6 +162,34 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - GPU access confirmed via `nvidia-smi`
 - Nightly run executed on 2026-01-09 (see `results/nightly/20260109_060121`)
 
+### Q7: NaN Propagation in Feature Generation (2026-01-14)
+- **Problem**: Features `superma_topvecMA`, `trendmagic_topavg`, `trendmagic_topsig`, `pvt_topvecMA` were 100% NaN, causing regime detector to fail (all predictions = "trend_up", probabilities = NaN)
+- **Root Cause**: NaN values from `wilder_atr` (during warmup period) propagated through stateful vector calculations in `superma.py`, `trendmagic.py`, and `pvt_eliminator.py`
+- **Fix Applied**: Modified modules to use `0` for decay values when `ATR` is `NaN` during warmup, preventing NaN propagation
+- **Status**: Feature generation fixed, but existing trained models may have been trained on NaN features and need retraining
+- **Next Steps**: Retrain models with fixed feature generation to verify regime detector works correctly
+- **Related Issues**:
+  - Feature prefix mismatch between `FeatureStore.build()` (used in inference) and `FeatureStore.build_features()` (used in training) - **Fixed**: Removed `legacy_` prefix from `build()` to match training
+  - `safe_mode` NaN filtering in `build()` was removing features that training kept - **Fixed**: Removed `safe_mode` filtering from `build()` to match training behavior
+
+---
+
+## Local Run Issues & Fixes (2026-01-19)
+
+- **GPU feature engineering disabled**: Training calls `build_features_once(..., use_gpu=False)` and backtest hard-codes `feature_store_use_gpu=False`, so FeatureStore never uses GPU. **Fix**: Add a `--featurestore-gpu` flag (or tie to `use_cuml`) and pass it into FeatureStore for train/backtest.
+- **`--recent` still builds full features**: Backtest computes features for all data, then slices. **Fix**: Slice early with a warmup buffer (max lookback) or add `--recent-warmup` to keep indicators correct while speeding local runs.
+- **Backtest has no feature cache**: Every run recomputes features even if inputs unchanged. **Fix**: Add optional cache path (e.g., `--feature-cache`) and reuse `FeatureStore.build_and_cache` to speed iteration.
+- **cuML pickle version mismatch**: GPU models fail to load across cuML/RAPIDS upgrades (`KeyError: 'n_cols'`). **Fix**: Store cuML/cuDF/RAPIDS versions in the training manifest and model metadata; verify on load and fail fast with actionable message (match env or retrain).
+- **Local GPU parity drift**: It is easy to run train/backtest on different conda envs or versions. **Fix**: Add local wrapper scripts (e.g., `tools/train_local.ps1`, `tools/backtest_local.ps1`) that activate the correct env and pin versions.
+
+### Agent Commentary (2026-01-19)
+
+- **GPU feature engineering**: Worth adding, but should be **tied to `use_cuml` by default** rather than a separate flag, to keep config simple. Recommend: `--featurestore-gpu` only if we discover cases where we want GPU models but CPU features (or vice versa). Profile first; if FeatureStore GPU only saves a few percent, keep it opt-in.
+- **`--recent` behavior**: Early slicing is a good idea, but **must include a warmup buffer** equal to the maximum lookback across all modules (SuperMA/TrendMagic/PVT + rolling stats). Recommend: `--recent N` + `--recent-warmup M` where `M` defaults conservatively (e.g. 1000 bars) so local iteration is faster but indicators remain valid.
+- **Feature cache for backtest**: High ROI. Recommend: add `--feature-cache PATH` which, when present, uses `FeatureStore.build_and_cache` (or equivalent) and **embeds a small metadata JSON** (data hash, ablation flags, horizon/label params) so we can cheaply detect when the cache is stale.
+- **cuML version mismatch**: Runtime patching of `__setstate__` is fragile. Better to **treat cuML models as versioned artifacts**: record `cuml`, `cudf`, `rapids`, `cuda` versions in both the training manifest and `model_data`, then on load: (1) compare versions, (2) if incompatible, fail fast with a clear message ("env mismatch, retrain or align versions"), and (3) suggest `--cpu-only` as a fallback. Patches can remain but should be considered best-effort, not relied on.
+- **Local GPU parity drift**: Wrapper scripts are good guardrails, but we should also have **inline env checks** in `train.py`/`backtest.py` (e.g., echo active env, Python, and RAPIDS versions) so misconfigurations are obvious even when commands are run manually. Long term, a `tools/check_env.py` or `python -m hybridyzer.check_env` command that validates all of this would be ideal.
+
 ---
 
 ## Proposals
@@ -149,7 +203,7 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - Confirmed `hybridyzer` conda env (RAPIDS 24.08, Python 3.10)
 - Ran GPU nightly: `results/nightly/20260109_060121` (no runs met drawdown constraint)
 
-### P2: GPU Pre-Transfer Optimization (2026-01-10)
+### ~~P2: GPU Pre-Transfer Optimization (2026-01-10)~~ IMPLEMENTED
 - **Problem**: Current walk-forward training converts pandas → cuDF 385 times (77 windows × 5 models), causing significant CPU→GPU transfer overhead (~30-40% of training time)
 - **Solution**: Pre-load full feature DataFrame to GPU once at start of walk-forward training, then slice cuDF DataFrames per window (no transfer needed)
 - **Expected speedup**: 2-3x faster training (from ~4-5 hours to ~1.5-2.5 hours per complete run)
@@ -160,7 +214,7 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - **Notes**:
   - Apply any window-dependent ops (rolling stats, label smoothing, purge/embargo) after slicing to avoid leakage
   - Track GPU memory pressure; fallback to chunked slicing if the full feature frame is too large
-- **Status**: Proposed, not yet implemented
+- **Status**: Implemented (2026-01-10)
 
 ## Critiques
 
@@ -221,6 +275,137 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 - Training command: `python train.py --runpod --walkforward`
 - Nightly runner: `python tools/nightly_runner.py --time-budget-hours 8 --promote-best`
 
+### 2026-01-10: GPU Pre-Transfer Optimization
+- Added GPU memory check helper function `_check_gpu_memory_safe_for_preload()` in `train.py`
+- Modified `combined_training()` to pre-load `cached_features` to cuDF once if GPU available and memory check passes
+- Modified `slice_window()` to support cuDF DataFrames (strip timezone info for cuDF compatibility)
+- Updated `RegimeDetector.fit()`, `SignalBlender.fit()`, `DirectionBlender.fit()` to accept cuDF directly
+- Added progress bar and heartbeat thread for better monitoring on RunPod
+- Added explicit `sys.stdout.flush()` calls for live output on remote systems
+
+### 2026-01-14: NaN Propagation Fix
+- **Issue**: Features `superma_topvecMA`, `trendmagic_topavg`, `trendmagic_topsig`, `pvt_topvecMA` were 100% NaN, breaking regime detector predictions
+- **Root Cause**: NaN values from `wilder_atr` (during warmup) propagated through stateful vector calculations
+- **Fix**: Modified `modules/superma.py`, `modules/trendmagic.py`, `modules/pvt_eliminator.py` to use `0` for decay values when `ATR` is `NaN`
+- **Impact**: Feature generation now produces valid values, but existing models trained on NaN features may need retraining
+- **Diagnostic**: Created `diagnostic_regime.py` to inspect feature generation and model behavior (temporary, deleted after debugging)
+
+### 2026-01-16: Cost-Aware Training + Backtest Fixes
+- Added cost-adjusted direction labels (round-trip costs added to label threshold)
+- Added CLI fee inputs: `--taker-fee-bps`, `--slippage-bps`, with `--fee-bps` deprecated
+- Backtest now charges costs on entry/exit/flip (position changes) and reports trade-level stats
+- Disabled low-confidence passthrough by default (`allow_low_confidence=False`)
+- Added `--deep-train` flag with larger model params for RegimeDetector and blenders
+
+### 2026-01-19: Separate Local WSL Setup
+- Created dedicated local WSL setup files separate from RunPod:
+  - `environment.local.yml` - Conda env for RTX 4070 (8GB VRAM)
+  - `requirements_local.txt` - Pip requirements for local setup
+  - `setup_local.sh` - Automated setup script for local WSL
+- Local uses `hybridyzer-local` conda env to avoid conflicts
+- Updated `docs/WSL_SETUP_STEPS.md` with local-specific instructions
+- **Note:** Avoid `--deep-train` on 8GB VRAM (risk of OOM)
+- Fixed line endings in `setup_local.sh` (CRLF → LF) and added `.gitattributes` to prevent future issues
+
+### 2026-01-19: GPU Auto-Detection for Backtesting
+- **Change**: `backtest.py` now auto-detects GPU availability by default
+- **Behavior**: 
+  - If GPU is available → uses cuML automatically
+  - If GPU not available → falls back to sklearn (CPU)
+  - `--cpu-only` flag forces CPU mode
+  - `--use-cuml` flag explicitly enables GPU (overrides auto-detect)
+- **Impact**: No need to specify `--use-cuml` flag anymore; GPU is used automatically when available
+
+### 2026-01-19: GPU Context Loss Handling (WSL)
+- **Problem**: WSL can lose GPU context during long training runs, causing `CUDA_ERROR_NO_DEVICE` errors
+- **Solution**: Added automatic GPU→CPU fallback when GPU context is lost:
+  - `_is_cuda_error()` - Detects CUDA-related exceptions
+  - `_check_gpu_available()` - Checks if GPU is still accessible
+  - Modified `slice_window()` to raise `RuntimeError("GPU_CONTEXT_LOST")` on CUDA errors
+  - Training loop automatically converts cuDF to pandas and continues with CPU when GPU context is lost
+- **Impact**: Training can now continue on CPU if GPU becomes unavailable mid-run (common in WSL)
+- **Note**: Most `CUDA_ERROR_NO_DEVICE` issues in WSL are caused by using wrong conda env (`hybridyzer` instead of `hybridyzer-local`). Always use `hybridyzer-local` for local WSL setup.
+
+### 2026-01-19: Local Run Efficiency + GPU Version Guardrails
+- Added GPU stack metadata capture for model artifacts and manifests (cuML/cuDF/cuPy/CUDA runtime)
+- cuML model load now fails fast with a clear error when GPU stack versions mismatch
+- FeatureStore GPU use is tied to `use_cuml` by default with `--featurestore-gpu` / `--featurestore-cpu` overrides
+- Backtest now supports `--recent-warmup` early slicing plus optional `--feature-cache` with metadata validation
+- Both train/backtest print runtime env summary (Python/conda/GPU stack) for quick misconfig detection
+
+---
+
+## Future Enhancements
+
+Extracted from `EDGE_IMPROVEMENT_TODO.txt` (archived to `docs/`). These are post-baseline improvements, not blockers for go-live.
+
+**Integration with Go-Live Checklist**: Each phase in `docs/GO_LIVE_CHECKLIST.md` has an "Enhancement Opportunities" section showing which items to consider at that stage. Phase 7 marks critical safety features that should be implemented before live trading.
+
+### High Priority
+
+| Enhancement | Description | Complexity |
+|-------------|-------------|------------|
+| Triple-barrier labels | Time + stop-loss + take-profit exit logic instead of fixed horizon | Medium |
+| Volatility-scaled position sizing | Size positions by ATR or realized vol, cap leverage | Medium |
+| Max daily loss / drawdown pause | Safety guardrail - halt trading on drawdown spike | Low |
+
+### Medium Priority
+
+| Enhancement | Description | Complexity |
+|-------------|-------------|------------|
+| Volatility-scaled label thresholds | Use ATR or realized vol instead of fixed threshold | Low |
+| Asymmetric thresholds | Different thresholds for long vs short | Low |
+| Time-of-day / day-of-week features | Seasonality features in FeatureStore | Low |
+| No-trade zones | Skip trades during low vol or high spread | Low |
+| Weekly walk-forward grid | Automated batch of configs, select by stability | Low |
+
+### Lower Priority / Exploratory
+
+| Enhancement | Description | Complexity |
+|-------------|-------------|------------|
+| Meta-model for trade quality | Predict trade quality and gate trades | High |
+| Regime-specific blenders | Separate blender models per regime | High |
+| Feature expansion: vol regime | Realized vol, ATR z-score, vol-of-vol | Medium |
+| Feature expansion: trend strength | Slope + distance from MA, ADX-like proxy | Medium |
+| Feature expansion: range compression | Range vs ATR, Bollinger width | Medium |
+| Feature expansion: volume divergence | Volume z-score, price-volume divergence | Medium |
+| Feature expansion: momentum exhaustion | RSI slope, MACD slope | Medium |
+| Timeframe comparison | 5m vs 15m, shorter vs longer history | Medium |
+| Time-based stop | Exit after N bars if no move | Low |
+
+---
+
+## Go-Live Checklist Review (2026-01-19)
+
+Reviewed and restructured `docs/GO_LIVE_CHECKLIST.md`.
+
+**Problems with original:**
+- Unclear when to retrain vs just backtest
+- No quantitative pass/fail gates
+- Too vague for LLM execution
+
+**Restructured version includes:**
+- **Decision table**: "What Changed → Action Required" (retrain vs backtest only)
+- **Minimum performance gates**: Sharpe > 0.3, Max DD < 30%, Trades > 30
+- **Per-phase success criteria**: Tables with specific PASS conditions
+- **Baseline recording step**: Explicit instruction to save Phase 2 metrics
+- **IF FAIL / IF PASS branches**: Clear decision tree
+- **Troubleshooting quick reference**: Common errors and fixes
+
+**Design goals:**
+- ELI5 for human: Simple rules, don't skip steps
+- Goal-oriented for LLMs: Unambiguous pass/fail criteria that can be verified
+
+---
+
+## Progress Tracking
+
+Progress through the GO_LIVE checklist is tracked in `docs/PROGRESS_REPORT.md`, including:
+- Dates and commands run
+- Results and metrics
+- Status of each phase
+- Key findings and next steps
+
 ---
 
 ## File Reference
@@ -267,9 +452,13 @@ OHLCV Data → FeatureStore → [RegimeDetector, SignalBlender, DirectionBlender
 | `train.py` | Main training script (~2900 lines) |
 | `backtest.py` | Backtesting with calibration |
 | `main.py` | Entry point / CLI |
-| `environment.runpod.yml` | GPU conda environment spec |
-| `requirements.txt` | Pip dependencies |
+| `environment.runpod.yml` | RunPod conda environment spec |
+| `environment.local.yml` | Local WSL conda environment spec |
+| `setup_runpod.sh` | RunPod automated setup script |
+| `setup_local.sh` | Local WSL automated setup script |
+| `requirements.txt` | Base pip dependencies (CPU) |
+| `requirements_runpod.txt` | RunPod pip dependencies (GPU) |
+| `requirements_local.txt` | Local WSL pip dependencies (GPU) |
 | `models/` | Trained models and artifacts |
 | `results/` | Training logs and metrics |
 | `data/` | OHLCV data files |
-
