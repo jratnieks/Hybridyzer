@@ -8,7 +8,9 @@ Supports regime-specific models for improved accuracy.
 from __future__ import annotations
 import pandas as pd
 import numpy as np
+from pathlib import Path
 from core.final_signal import FinalSignalGenerator
+from core.pattern_memory import PatternMemory, MemoryGate
 
 
 def infer(
@@ -19,7 +21,9 @@ def infer(
     direction_model_path: str = "models/blender_direction_model.pkl",
     blender_model_path: str = "models/blender_model.pkl",
     scaler_path: str = "models/feature_scaler.pkl",
-    use_gpu: bool = True
+    use_gpu: bool = True,
+    enable_pattern_memory: bool = False,
+    enable_memory_gate: bool = False,
 ) -> dict:
     """
     Run inference on incoming bar data using FinalSignalGenerator.
@@ -54,8 +58,45 @@ def infer(
         scaler_path=scaler_path
     )
     
+    # Build features
+    features = signal_generator._build_features(df)
+    
+    # Add PatternMemory features if enabled
+    pattern_memory = None
+    if enable_pattern_memory:
+        models_dir = Path(regime_model_path).parent
+        pattern_memory_path = models_dir / "pattern_memory"
+        if pattern_memory_path.parent.exists():
+            pattern_memory = PatternMemory()
+            try:
+                pattern_memory.load(pattern_memory_path)
+                # Add mem_* features
+                mem_features = pattern_memory.transform(features, df)
+                features = pd.concat([features, mem_features], axis=1)
+            except Exception as e:
+                print(f"[PatternMemory] Warning: Could not load memory: {e}")
+                pattern_memory = None
+    
     # Generate final signal
-    results = signal_generator.generate_signal(df)
+    signals, ev_series = signal_generator.predict(features=features, df=df)
+    
+    # Get regime predictions
+    regime = signal_generator.regime_detector.predict(features)
+    
+    # Apply MemoryGate if enabled
+    if enable_memory_gate and pattern_memory is not None:
+        memory_gate = MemoryGate()
+        # Get direction confidence for soft penalty
+        direction_confidence = signal_generator.direction_confidence.reindex(signals.index).fillna(0.0)
+        signals = memory_gate.apply(signals, features, ml_proba=direction_confidence)
+    
+    # Build results dict (matching generate_signal format)
+    results = {
+        'signal': signals,
+        'regime': regime.reindex(signals.index),
+        'confidence': signal_generator.direction_confidence.reindex(signals.index).fillna(0.0),
+        'direction_proba': signal_generator.direction_confidence.reindex(signals.index).fillna(0.0),
+    }
     
     # For single-row input, return scalar values for convenience
     # For multi-row input, return Series
@@ -87,6 +128,10 @@ def main():
                         help="Show last N signals (default: 20)")
     parser.add_argument("--no-gpu", action="store_true",
                         help="Disable GPU (use CPU only)")
+    parser.add_argument('--pattern-memory', action='store_true',
+                        help='Enable PatternMemory: load memory table and add mem_* features (default: off)')
+    parser.add_argument('--memory-gate', action='store_true',
+                        help='Enable MemoryGate: apply veto/penalty to signals (default: off)')
     args = parser.parse_args()
     
     print(f"Loading data from {args.data}...")
@@ -112,7 +157,9 @@ def main():
         df,
         probability_threshold=args.threshold,
         require_blender_agreement=args.require_agreement,
-        use_gpu=not args.no_gpu
+        use_gpu=not args.no_gpu,
+        enable_pattern_memory=args.pattern_memory,
+        enable_memory_gate=args.memory_gate,
     )
     
     # Create summary dataframe

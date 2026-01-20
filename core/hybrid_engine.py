@@ -8,6 +8,7 @@ from core.feature_store import FeatureStore
 from core.regime_detector import RegimeDetector
 from core.signal_blender import SignalBlender
 from core.risk_layer import RiskLayer
+from core.pattern_memory import PatternMemory, MemoryGate
 
 
 class HybridEngine:
@@ -20,7 +21,9 @@ class HybridEngine:
         signal_modules: List[SignalModule],
         context_modules: Optional[List[ContextModule]] = None,
         regime_model_path: str = "models/regime_model.pkl",
-        blender_model_path: str = "models/blender_model.pkl"
+        blender_model_path: str = "models/blender_model.pkl",
+        enable_pattern_memory: bool = False,
+        enable_memory_gate: bool = False,
     ):
         """
         Initialize the hybrid engine with modules and load ML models.
@@ -54,6 +57,26 @@ class HybridEngine:
             print(f"Loaded signal blender from {blender_path}")
         else:
             print(f"Warning: Blender model not found at {blender_path}")
+        
+        # PatternMemory and MemoryGate
+        self.enable_pattern_memory = enable_pattern_memory
+        self.enable_memory_gate = enable_memory_gate
+        self.pattern_memory = None
+        self.memory_gate = None
+        
+        if enable_pattern_memory:
+            pattern_memory_path = Path(regime_model_path).parent / "pattern_memory"
+            if pattern_memory_path.parent.exists():
+                try:
+                    self.pattern_memory = PatternMemory()
+                    self.pattern_memory.load(pattern_memory_path)
+                    print(f"[HybridEngine] PatternMemory loaded")
+                except Exception as e:
+                    print(f"[HybridEngine] Warning: Could not load PatternMemory: {e}")
+        
+        if enable_memory_gate:
+            self.memory_gate = MemoryGate()
+            print(f"[HybridEngine] MemoryGate enabled")
 
     def process(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -77,6 +100,13 @@ class HybridEngine:
         features = self.feature_store.build_features(
             df, self.signal_modules, self.context_modules
         )
+        
+        # Add PatternMemory features if enabled
+        if self.enable_pattern_memory and self.pattern_memory is not None:
+            # Need full features (with MLFeatures) for key computation
+            features_full = self.feature_store.build(df)
+            mem_features = self.pattern_memory.transform(features_full, df)
+            features = pd.concat([features, mem_features], axis=1)
         
         # Step 2: Detect regime
         regime = self.regime_detector.predict(features)
@@ -107,6 +137,11 @@ class HybridEngine:
         
         # Predict blended signal
         blended_signal = self.signal_blender.predict(features_signals)
+        
+        # Apply MemoryGate if enabled (after ML scoring, before RiskLayer)
+        if self.enable_memory_gate and self.memory_gate is not None:
+            # Use features_signals which includes mem_* if PatternMemory was enabled
+            blended_signal = self.memory_gate.apply(blended_signal, features_signals)
         
         # Step 5: Apply risk layer
         final_signal = self.risk_layer.apply_risk(blended_signal, df)

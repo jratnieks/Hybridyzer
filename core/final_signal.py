@@ -17,6 +17,7 @@ from core.regime_detector import RegimeDetector
 from core.signal_blender import SignalBlender, DirectionBlender
 from core.scalers import Scaler
 from core.feature_store import FeatureStore
+from core.pattern_memory import MemoryGate
 from modules.superma import SuperMA4hr
 from modules.trendmagic import TrendMagicV2
 from modules.pvt_eliminator import PVTEliminator
@@ -124,7 +125,8 @@ class FinalSignalGenerator:
         disable_regime: Optional[Dict[str, bool]] = None,
         disable_shorts: bool = False,
         min_ev: Optional[float] = None,
-        calibration_csv_path: Optional[str] = None
+        calibration_csv_path: Optional[str] = None,
+        enable_memory_gate: bool = False,
     ):
         """
         Initialize final signal generator.
@@ -190,6 +192,10 @@ class FinalSignalGenerator:
         self.ev_lookup = None  # Will be populated if calibration CSV is provided (list of records)
         self.ev_loaded = False  # Flag indicating if EV lookup is loaded and ready
         self.ev_filtered_count = 0  # Track how many trades were filtered by EV
+        
+        # MemoryGate
+        self.enable_memory_gate = enable_memory_gate
+        self.memory_gate = MemoryGate() if enable_memory_gate else None
         
         # Load calibration CSV if provided (for EV computation and optional filtering)
         # Always load if calibration_csv_path is provided, regardless of min_ev
@@ -638,6 +644,9 @@ class FinalSignalGenerator:
                 raise ValueError("Either features or df must be provided")
             features = self._build_features(df)
         
+        # Store original features for MemoryGate (needs mem_* columns if PatternMemory was used)
+        features_for_gate = features.copy()
+        
         # Ensure models are loaded
         if self.regime_detector is None or self.direction_blender is None:
             raise ValueError("Models not loaded. Call load_models() first.")
@@ -908,6 +917,12 @@ class FinalSignalGenerator:
         if self.disable_shorts_flag:
             short_count_final = (final_signal < 0).sum()
             assert short_count_final == 0, f"disable_shorts_flag is True but {short_count_final} short signals remain"
+        
+        # Apply MemoryGate if enabled (after all ML logic, before final return)
+        if self.enable_memory_gate and self.memory_gate is not None:
+            # Get direction confidence for soft penalty
+            direction_confidence = self._direction_confidence_temp.copy()
+            final_signal = self.memory_gate.apply(final_signal, features_for_gate, ml_proba=direction_confidence)
         
         # Store direction confidence as instance variable for access after prediction
         self.direction_confidence = self._direction_confidence_temp.copy()

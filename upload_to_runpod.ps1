@@ -30,11 +30,13 @@ if (-not $SshCommand) {
 if ($SshCommand -match 'root@([\d\.]+).*-p\s*(\d+)') {
     $IP = $Matches[1]
     $PORT = $Matches[2]
-} elseif ($SshCommand -match '([\d\.]+):(\d+)') {
+}
+elseif ($SshCommand -match '([\d\.]+):(\d+)') {
     # Also accept IP:PORT format
     $IP = $Matches[1]
     $PORT = $Matches[2]
-} else {
+}
+else {
     Write-Host "Could not parse SSH command. Expected format:" -ForegroundColor Red
     Write-Host "  ssh root@<IP> -p <PORT> -i ~/.ssh/id_ed25519" -ForegroundColor Red
     exit 1
@@ -52,10 +54,94 @@ if (-not (Test-Path $SshKey)) {
     $SshKey = "$env:USERPROFILE\.ssh\id_rsa"
 }
 
+# SSH agent setup - cache passphrase for session
+Write-Host "Checking SSH agent..." -ForegroundColor Yellow
+$sshAgentProcess = Get-Process ssh-agent -ErrorAction SilentlyContinue
+if (-not $sshAgentProcess) {
+    Write-Host "Starting SSH agent..." -ForegroundColor Yellow
+    Start-Process ssh-agent -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+}
+
+# Check if key is already loaded in agent
+$keyLoaded = $false
+try {
+    $keys = & ssh-add -l 2>&1
+    if ($LASTEXITCODE -eq 0 -and $keys -match [regex]::Escape($SshKey)) {
+        Write-Host "SSH key already loaded in agent" -ForegroundColor Green
+        $keyLoaded = $true
+    }
+}
+catch {
+    # ssh-add might not be available, continue
+}
+
+# Add key to agent if not loaded
+if (-not $keyLoaded) {
+    Write-Host "Adding SSH key to agent (enter passphrase once)..." -ForegroundColor Yellow
+    & ssh-add $SshKey
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "SSH key added to agent - passphrase cached for this session" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Warning: Failed to add key to agent. You may need to enter passphrase multiple times." -ForegroundColor Yellow
+    }
+}
+
+# SSH/SCP common options with keepalive to prevent connection drops
+# Use array format so PowerShell expands them correctly
+$SshCommonOpts = @(
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=3",
+    "-o", "ConnectTimeout=10"
+)
+
+# STEP 1: Ensure repo exists on pod (before upload)
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  Preparing Remote Environment" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Checking if Hybridyzer is cloned..." -ForegroundColor Yellow
+$checkCmd = "if [ -d /workspace/Hybridyzer ]; then echo 'EXISTS'; else echo 'MISSING'; fi"
+$result = & ssh -p $PORT -i $SshKey $SshCommonOpts "root@$IP" $checkCmd 2>&1
+
+if ($result -match "MISSING") {
+    Write-Host "Cloning repository..." -ForegroundColor Yellow
+    $cloneResult = & ssh -p $PORT -i $SshKey $SshCommonOpts "root@$IP" "cd /workspace && git clone https://github.com/jratnieks/Hybridyzer.git" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Failed to clone repository:" -ForegroundColor Red
+        Write-Host $cloneResult -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Repository cloned successfully" -ForegroundColor Green
+}
+else {
+    Write-Host "Repository exists, pulling latest..." -ForegroundColor Green
+    $pullResult = & ssh -p $PORT -i $SshKey $SshCommonOpts "root@$IP" "cd /workspace/Hybridyzer && git pull origin master" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Warning: git pull failed (continuing anyway)" -ForegroundColor Yellow
+    }
+}
+
+# Ensure data directory exists
+Write-Host "Ensuring data directory exists..." -ForegroundColor Yellow
+& ssh -p $PORT -i $SshKey $SshCommonOpts "root@$IP" "mkdir -p /workspace/Hybridyzer/data" | Out-Null
+Write-Host "Data directory ready" -ForegroundColor Green
+
 $success = 0
 $totalFiles = 0
 
+# STEP 2: Upload data files
 if (-not $SkipUpload) {
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "  Uploading Data Files" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    
     # Find data files
     $DataDir = Join-Path $PSScriptRoot "data"
     $FilesToUpload = @(
@@ -73,7 +159,8 @@ if (-not $SkipUpload) {
             $size = [math]::Round((Get-Item $path).Length / 1MB, 1)
             Write-Host "  Found: $file ($size MB)" -ForegroundColor Green
             $ExistingFiles += $path
-        } else {
+        }
+        else {
             Write-Host "  Missing: $file" -ForegroundColor Yellow
         }
     }
@@ -97,28 +184,30 @@ if (-not $SkipUpload) {
         
         $dest = "root@${IP}:/workspace/Hybridyzer/data/"
         
-        # Run scp
-        $scpResult = & scp -P $PORT -i $SshKey -o StrictHostKeyChecking=no $file $dest 2>&1
+        # Run scp with keepalive to prevent connection drops
+        $scpResult = & scp -P $PORT -i $SshKey $SshCommonOpts $file $dest 2>&1
         
         if ($LASTEXITCODE -eq 0) {
             Write-Host " OK" -ForegroundColor Green
             $success++
-        } else {
+        }
+        else {
             Write-Host " FAILED" -ForegroundColor Red
             Write-Host "  $scpResult" -ForegroundColor Red
         }
     }
-} else {
-    Write-Host "Skipping file upload (-SkipUpload flag)" -ForegroundColor Yellow
-}
-
-if (-not $SkipUpload) {
+    
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host "  Upload Complete: $success/$totalFiles files" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
 }
+else {
+    Write-Host ""
+    Write-Host "Skipping file upload (-SkipUpload flag)" -ForegroundColor Yellow
+}
 
+# STEP 3: Run setup if requested
 # Ask about setup if not specified
 if (-not $Setup -and -not $SkipUpload) {
     Write-Host ""
@@ -135,25 +224,11 @@ if ($Setup) {
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
-    # First check if repo exists, if not clone it
-    Write-Host "Checking if Hybridyzer is cloned..." -ForegroundColor Yellow
-    $checkCmd = "if [ -d /workspace/Hybridyzer ]; then echo 'EXISTS'; else echo 'MISSING'; fi"
-    $result = & ssh -p $PORT -i $SshKey -o StrictHostKeyChecking=no "root@$IP" $checkCmd 2>&1
-    
-    if ($result -match "MISSING") {
-        Write-Host "Cloning repository..." -ForegroundColor Yellow
-        & ssh -p $PORT -i $SshKey -o StrictHostKeyChecking=no "root@$IP" "cd /workspace && git clone https://github.com/jratnieks/Hybridyzer.git"
-    } else {
-        Write-Host "Repository exists, pulling latest..." -ForegroundColor Green
-        & ssh -p $PORT -i $SshKey -o StrictHostKeyChecking=no "root@$IP" "cd /workspace/Hybridyzer && git pull origin master"
-    }
-    
-    Write-Host ""
     Write-Host "Running setup_runpod.sh..." -ForegroundColor Yellow
     Write-Host ""
     
     # Run setup script (this will show output live)
-    & ssh -p $PORT -i $SshKey -o StrictHostKeyChecking=no "root@$IP" "cd /workspace/Hybridyzer && bash setup_runpod.sh"
+    & ssh -p $PORT -i $SshKey $SshCommonOpts "root@$IP" "cd /workspace/Hybridyzer && bash setup_runpod.sh"
     
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
@@ -165,12 +240,15 @@ if ($Setup) {
     Write-Host "  cd /workspace/Hybridyzer"
     Write-Host "  python train.py --runpod --walkforward"
     Write-Host ""
-} else {
+}
+else {
     Write-Host ""
     Write-Host "Next: SSH into RunPod and start training:" -ForegroundColor Yellow
     Write-Host "  $SshCommand"
     Write-Host "  cd /workspace/Hybridyzer"
-    Write-Host "  bash setup_runpod.sh  # if first time"
+    if (-not $SkipUpload) {
+        Write-Host "  bash setup_runpod.sh  # if first time"
+    }
     Write-Host "  python train.py --runpod --walkforward"
     Write-Host ""
 }

@@ -501,19 +501,35 @@ def main() -> None:
     best_summary: Optional[Dict[str, object]] = None
 
     results_log = base_out / "runs.jsonl"
-    total_runs = args.max_runs if args.bandit_thompson else len(configs)
-    for idx in range(1, total_runs + 1):
+    # With Thompson sampling, run until time budget exhausted (max_runs is ignored)
+    # Without Thompson sampling, run through all configs (up to max_runs if specified)
+    if args.bandit_thompson:
+        # Use a very large number so loop only stops on time budget
+        total_runs = 999999
+    else:
+        total_runs = min(args.max_runs, len(configs)) if args.max_runs else len(configs)
+    
+    idx = 0
+    while True:
         remaining = int(deadline - time.time())
         if remaining <= 0:
             print("[Runner] Time budget exhausted.")
             break
+        if not args.bandit_thompson and idx >= total_runs:
+            print(f"[Runner] Completed {total_runs} runs.")
+            break
+        
+        idx += 1
 
         arm_key = None
         if args.bandit_thompson:
             arm_key, arm = _choose_bandit_arm(bandit_state, rng)
             cfg = arm["config"]
         else:
-            cfg = configs[idx - 1]
+            cfg = configs[idx - 1] if idx <= len(configs) else None
+            if cfg is None:
+                print(f"[Runner] All {len(configs)} configs completed.")
+                break
 
         run_dir = base_out / f"run_{idx:03d}"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -535,7 +551,10 @@ def main() -> None:
         cmd = _build_train_command(args, cfg, train_log_path)
         pre_mtime = MODELS_DIR.joinpath("training_results.csv").stat().st_mtime if (MODELS_DIR / "training_results.csv").exists() else None
 
-        print(f"[Runner] Run {idx}/{total_runs}: horizon={cfg['horizon_bars']} smoothing={cfg['smoothing_window']}")
+        if args.bandit_thompson:
+            print(f"[Runner] Run {idx}: horizon={cfg['horizon_bars']} smoothing={cfg['smoothing_window']}")
+        else:
+            print(f"[Runner] Run {idx}/{total_runs}: horizon={cfg['horizon_bars']} smoothing={cfg['smoothing_window']}")
         print(f"[Runner] Remaining budget: {remaining // 60} min")
 
         returncode, reason = _run_train(cmd, timeout_seconds=remaining, runner_log_path=runner_log_path)
